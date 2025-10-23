@@ -10,7 +10,7 @@ st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
 GAMMA_API_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_API_MARKET_URL = "https://gamma-api.polymarket.com/markets/"
-CLOB_PRICES_URL = "https://clob.polymarket.com/prices"  # New: Best bid/ask endpoint
+CLOB_PRICES_URL = "https://clob.polymarket.com/prices"  # Batch bid/ask
 HEADERS = {'User-Agent': 'PolymarketStreamlitMonitor/2.0', 'Content-Type': 'application/json'}
 
 TARGET_CANDIDATES = {
@@ -34,7 +34,6 @@ def robust_fetch(url, method='GET', json_data=None):
         return None
 
 def get_prices_from_clob(token_ids):
-    """Fetch best bid/ask for multiple tokens (per docs)."""
     if not token_ids:
         return {}
     json_data = {'token_ids': token_ids}
@@ -42,6 +41,12 @@ def get_prices_from_clob(token_ids):
     if data:
         return data  # {token_id: {'bid': 0.50, 'ask': 0.52}}
     return {}
+
+def safe_int(value):
+    try:
+        return int(float(value or 0))
+    except:
+        return 0
 
 def safe_float(value):
     try:
@@ -58,7 +63,7 @@ def fetch_data(debug=False):
     markets = event.get('markets', [])
     
     candidates = []
-    token_ids = []  # Collect for batch prices call
+    token_ids = []
     
     for market in markets:
         market_id = market.get('id')
@@ -73,14 +78,14 @@ def fetch_data(debug=False):
         if name not in TARGET_CANDIDATES:
             continue
         
-        volume = int(market_data.get('volume') or 0)
+        # FIXED: Safe volume (handles '46276.361943')
+        volume = safe_int(market_data.get('volume'))
         token_ids_raw = market_data.get('clobTokenIds', [])
         if not token_ids_raw:
             continue
-        yes_token = token_ids_raw[0]  # Yes token
+        yes_token = token_ids_raw[0]
         token_ids.append(yes_token)
         
-        # Temp store
         candidates.append({
             'name': name,
             'volume': volume,
@@ -91,10 +96,10 @@ def fetch_data(debug=False):
         if len(candidates) == 4:
             break
     
-    # BATCH FETCH REAL BID/ASK
+    # BATCH CLOB CALL FOR REAL BID/ASK
     clob_prices = get_prices_from_clob(token_ids)
     if debug:
-        st.info(f"CLOB Response: {json.dumps(clob_prices, indent=2)}")
+        st.info(f"CLOB Response Keys: {list(clob_prices.keys())} | Sample: {json.dumps(list(clob_prices.values())[:1], indent=2)}")
     
     for i, cand in enumerate(candidates):
         token = cand['yes_token']
@@ -102,11 +107,13 @@ def fetch_data(debug=False):
             buy_price = safe_float(clob_prices[token].get('ask', 0))
             sell_price = safe_float(clob_prices[token].get('bid', 0))
             source = "CLOB (Real Bid/Ask)"
+            if debug:
+                st.success(f"{cand['name']}: Real book - Buy {buy_price*100:.1f}% | Sell {sell_price*100:.1f}%")
         else:
             buy_price = sell_price = cand['midpoint']
-            source = "Midpoint (No Book Data - Check API)"
+            source = "Midpoint (CLOB Empty - Check Site for Spread)"
             if debug:
-                st.warning(f"{cand['name']}: No CLOB data for {token}")
+                st.warning(f"{cand['name']}: CLOB empty for {token[:20]}... - Using midpoint {cand['midpoint']*100:.1f}%")
         
         candidates[i]['buy_price'] = buy_price
         candidates[i]['sell_price'] = sell_price
