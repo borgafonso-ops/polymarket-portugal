@@ -1,140 +1,84 @@
 import streamlit as st
 import requests
-import time
+from bs4 import BeautifulSoup
 import pandas as pd
 from datetime import datetime
 import re
-import json
+import time
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-GAMMA_API_EVENTS_URL = "https://gamma-api.polymarket.com/events"
-GAMMA_API_MARKET_URL = "https://gamma-api.polymarket.com/markets/"
-CLOB_PRICES_URL = "https://clob.polymarket.com/prices"
-HEADERS = {'User-Agent': 'PolymarketStreamlitMonitor/2.0', 'Content-Type': 'application/json'}
-
-TARGET_CANDIDATES = {
-    "Henrique Gouveia e Melo",
-    "Luís Marques Mendes", 
-    "António José Seguro",
-    "André Ventura"
+# Live market URLs (direct from Polymarket)
+MARKET_URLS = {
+    "Henrique Gouveia e Melo": "https://polymarket.com/event/portugal-presidential-election/will-henrique-gouveia-e-melo-win",
+    "Luís Marques Mendes": "https://polymarket.com/event/portugal-presidential-election/will-luis-marques-mendes-win", 
+    "António José Seguro": "https://polymarket.com/event/portugal-presidential-election/will-antonio-jose-seguro-win",
+    "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win"
 }
 
-@st.cache_data(ttl=10)
-def robust_fetch(url, method='GET', json_data=None):
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
+
+def scrape_market(url):
+    """Scrape LIVE bid/ask from Polymarket trading page"""
     try:
-        time.sleep(0.5)
-        if method == 'POST':
-            resp = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
-        else:
-            resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except:
-        return None
-
-def safe_int(value):
-    try:
-        return int(float(value or 0))
-    except:
-        return 0
-
-def safe_float(value):
-    try:
-        return float(value or 0)
-    except:
-        return 0.0
-
-def get_prices_from_clob(token_ids):
-    if not token_ids:
-        return {}
-    json_data = {'token_ids': token_ids}
-    data = robust_fetch(CLOB_PRICES_URL, method='POST', json_data=json_data)
-    if data:
-        return data  # FIXED: {token_id: [bid, ask]} format
-    return {}
-
-def fetch_data(debug=False):
-    event_data = robust_fetch(f"{GAMMA_API_EVENTS_URL}?slug=portugal-presidential-election")
-    if not event_data or not isinstance(event_data, list) or not event_data[0]:
-        return []
-    
-    event = event_data[0]
-    markets = event.get('markets', [])
-    
-    candidates = []
-    token_ids = []
-    
-    for market in markets:
-        market_id = market.get('id')
-        if not market_id:
-            continue
-            
-        market_data = robust_fetch(f"{GAMMA_API_MARKET_URL}{market_id}")
-        if not market_data:
-            continue
-            
-        name = extract_candidate_name(market_data.get('question', ''))
-        if name not in TARGET_CANDIDATES:
-            continue
+        time.sleep(1)
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        volume = safe_int(market_data.get('volume'))
-        token_ids_raw = market_data.get('clobTokenIds', [])
-        if not token_ids_raw:
-            continue
-        yes_token = token_ids_raw[0]
-        token_ids.append(yes_token)
+        # Find YES bid/ask elements (Polymarket HTML structure)
+        bid_elem = soup.find('span', {'data-testid': 'bid-price'})
+        ask_elem = soup.find('span', {'data-testid': 'ask-price'})
+        
+        if bid_elem and ask_elem:
+            sell_price = float(bid_elem.text.strip('%')) / 100  # Bid
+            buy_price = float(ask_elem.text.strip('%')) / 100   # Ask
+            return buy_price, sell_price
+        
+        # Fallback: Parse from price display
+        price_elem = soup.find('span', class_='price-display')
+        if price_elem:
+            price_text = price_elem.text.strip('%')
+            price = float(price_text) / 100
+            return price, price  # Midpoint fallback
+        
+        return 0.0, 0.0
+    except:
+        return 0.0, 0.0
+
+def fetch_data():
+    candidates = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, (name, url) in enumerate(MARKET_URLS.items()):
+        status_text.text(f"Scraping {name}...")
+        buy_price, sell_price = scrape_market(url)
         
         candidates.append({
             'name': name,
-            'volume': volume,
-            'yes_token': yes_token,
-            'midpoint': safe_float(market_data.get('lastPrice') or market_data.get('lastTradePrice'))
+            'buy_price': buy_price,
+            'sell_price': sell_price,
+            'volume': 0,  # Volume from API if needed later
+            'source': 'LIVE Trading Page'
         })
         
-        if len(candidates) == 4:
-            break
+        progress_bar.progress((i + 1) / len(MARKET_URLS))
     
-    # FIXED: CORRECT PARSING FOR [bid, ask] FORMAT
-    clob_prices = get_prices_from_clob(token_ids)
-    if debug:
-        st.info(f"CLOB RAW: {json.dumps(clob_prices, indent=2)}")
-    
-    for i, cand in enumerate(candidates):
-        token = cand['yes_token']
-        if token in clob_prices:
-            # FIXED: [bid, ask] array, not dict
-            prices = clob_prices[token]
-            sell_price = safe_float(prices[0])  # bid
-            buy_price = safe_float(prices[1])   # ask
-            source = "CLOB (Real Bid/Ask)"
-        else:
-            buy_price = sell_price = cand['midpoint']
-            source = "Midpoint (No CLOB)"
-        
-        candidates[i]['buy_price'] = buy_price
-        candidates[i]['sell_price'] = sell_price
-        candidates[i]['source'] = source
-    
+    status_text.text('Done!')
     return candidates
 
-def extract_candidate_name(question):
-    if not question:
-        return None
-    match = re.search(r'Will (.*?) win', question)
-    return match.group(1).strip() if match else None
-
 # MAIN
-st.title("Polymarket Portugal - 100 Contract Basket Arb")
+st.title("Polymarket Portugal - LIVE Trading Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-debug = st.checkbox("Debug: Show CLOB Response", value=False)
-
-with st.spinner("Fetching CLOB prices..."):
-    data = fetch_data(debug=debug)
+with st.spinner("Scraping LIVE bid/ask from Polymarket.com..."):
+    data = fetch_data()
 
 if not data:
-    st.error("No data")
+    st.error("Failed to load - retry")
     st.stop()
 
 data.sort(key=lambda x: x['buy_price'], reverse=True)
@@ -147,38 +91,40 @@ total_sell_proceeds = 0
 for i, d in enumerate(data):
     with cols[i]:
         st.markdown(f"**{d['name'].split()[-1]}**")
-        st.caption(f"{d['name'][:15]}... | ${d['volume']:,.0f}")
         
         buy_pct = d['buy_price'] * 100
         sell_pct = d['sell_price'] * 100
         
-        st.metric("Buy", f"{buy_pct:.1f}%")
-        st.metric("Sell", f"{sell_pct:.1f}%")
+        st.metric("BUY (Ask)", f"{buy_pct:.1f}%")
+        st.metric("SELL (Bid)", f"{sell_pct:.1f}%")
         
         total_buy_cost += d['buy_price']
         total_sell_proceeds += d['sell_price']
 
-# BASKET
+# BASKET TOTALS
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
-    st.metric("TOTAL BUY", f"{total_buy_cost*100:.1f}%", f"{total_buy_cost*100-100:+.1f}%")
+    st.metric("TOTAL BUY BASKET", f"${total_buy_cost*100:.1f}", f"{total_buy_cost*100-100:+.1f}%")
 with col2:
-    st.metric("TOTAL SELL", f"{total_sell_proceeds*100:.1f}%", f"{total_sell_proceeds*100-100:+.1f}%")
+    st.metric("TOTAL SELL BASKET", f"${total_sell_proceeds*100:.1f}", f"{total_sell_proceeds*100-100:+.1f}%")
 
-# ARB
-st.subheader("ARBITRAGE")
-if total_buy_cost < 1:
-    profit = 100 - total_buy_cost * 100
-    st.success(f"BUY ARB: {profit:.1f}% PROFIT")
-elif total_sell_proceeds > 1:
-    profit = total_sell_proceeds * 100 - 100
-    st.success(f"SELL ARB: {profit:.1f}% PROFIT")
+# ARB CALC
+st.subheader("🤑 ARBITRAGE")
+basket_cost = total_buy_cost * 100
+basket_value = total_sell_proceeds * 100
+
+if basket_cost < 100:
+    profit_pct = 100 - basket_cost
+    st.success(f"🟢 **BUY BASKET NOW**: Cost ${basket_cost:.1f} → **{profit_pct:.1f}% INSTANT PROFIT**")
+elif basket_value > 100:
+    profit_pct = basket_value - 100
+    st.success(f"🔴 **SELL BASKET NOW**: Value ${basket_value:.1f} → **{profit_pct:.1f}% INSTANT PROFIT**")
 else:
-    st.info("No Arb")
+    st.info("⚖️ Balanced - Wait for mispricing")
 
 # CHART
-st.subheader("Bid/Ask Spreads")
+st.subheader("LIVE Bid/Ask Spreads")
 buy_data = [d['buy_price']*100 for d in data]
 sell_data = [d['sell_price']*100 for d in data]
 candidates = [d['name'].split()[-1] for d in data]
@@ -192,17 +138,17 @@ chart_data = pd.DataFrame({
 
 st.bar_chart(chart_data, height=350)
 
-# TABLE
+# TRADE TABLE
+st.subheader("TRADE EXECUTION")
 table_data = []
 for d in data:
     table_data.append({
         'Candidate': d['name'],
-        'Buy %': f"{d['buy_price']*100:.2f}",
-        'Sell %': f"{d['sell_price']*100:.2f}",
-        'Spread': f"{(d['buy_price']-d['sell_price'])*100:.2f}%",
-        'Volume': f"${d['volume']:,.0f}"
+        'BUY @': f"{d['buy_price']*100:.2f}%",
+        'SELL @': f"{d['sell_price']*100:.2f}%", 
+        'SPREAD': f"{(d['buy_price']-d['sell_price'])*100:.2f}%"
     })
 st.dataframe(table_data)
 
-if st.button("Refresh"):
+if st.button("🔄 REFRESH LIVE TRADING DATA"):
     st.rerun()
