@@ -8,12 +8,12 @@ import time
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-# Live market URLs (direct from Polymarket)
+# Direct market URLs (update if slugs change)
 MARKET_URLS = {
-    "Henrique Gouveia e Melo": "https://polymarket.com/event/portugal-presidential-election/will-henrique-gouveia-e-melo-win",
-    "Luís Marques Mendes": "https://polymarket.com/event/portugal-presidential-election/will-luis-marques-mendes-win", 
-    "António José Seguro": "https://polymarket.com/event/portugal-presidential-election/will-antonio-jose-seguro-win",
-    "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win"
+    "Henrique Gouveia e Melo": "https://polymarket.com/event/portugal-presidential-election/will-henrique-gouveia-e-melo-win-the-portugal-presidential-election",
+    "Luís Marques Mendes": "https://polymarket.com/event/portugal-presidential-election/will-luis-marques-mendes-win-the-portugal-presidential-election",
+    "António José Seguro": "https://polymarket.com/event/portugal-presidential-election/will-antonio-jose-seguro-win-the-portugal-presidential-election",
+    "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win-the-portugal-presidential-election"
 }
 
 HEADERS = {
@@ -21,134 +21,142 @@ HEADERS = {
 }
 
 def scrape_market(url):
-    """Scrape LIVE bid/ask from Polymarket trading page"""
+    """Scrape live bid/ask from Polymarket market page."""
     try:
-        time.sleep(1)
-        resp = requests.get(url, headers=HEADERS, timeout=10)
+        time.sleep(1)  # Rate limit
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # Find YES bid/ask elements (Polymarket HTML structure)
-        bid_elem = soup.find('span', {'data-testid': 'bid-price'})
-        ask_elem = soup.find('span', {'data-testid': 'ask-price'})
+        # Target YES bid/ask (Polymarket UI classes for price display)
+        # Bid (sell price): green button or .bid-price
+        # Ask (buy price): red button or .ask-price
+        bid_elem = soup.find('div', class_=re.compile(r'bid|sell-price')) or soup.find('span', text=re.compile(r'bid|sell'))
+        ask_elem = soup.find('div', class_=re.compile(r'ask|buy-price')) or soup.find('span', text=re.compile(r'ask|buy'))
         
         if bid_elem and ask_elem:
-            sell_price = float(bid_elem.text.strip('%')) / 100  # Bid
-            buy_price = float(ask_elem.text.strip('%')) / 100   # Ask
+            sell_price = float(re.search(r'(\d+\.?\d*)', bid_elem.text).group(1)) / 100 if re.search(r'(\d+\.?\d*)', bid_elem.text) else 0.0
+            buy_price = float(re.search(r'(\d+\.?\d*)', ask_elem.text).group(1)) / 100 if re.search(r'(\d+\.?\d*)', ask_elem.text) else 0.0
             return buy_price, sell_price
         
-        # Fallback: Parse from price display
-        price_elem = soup.find('span', class_='price-display')
+        # Fallback: Midpoint from main price display
+        price_elem = soup.find('div', class_=re.compile(r'price|odds'))
         if price_elem:
-            price_text = price_elem.text.strip('%')
-            price = float(price_text) / 100
-            return price, price  # Midpoint fallback
+            price_text = re.search(r'(\d+\.?\d*)', price_elem.text)
+            if price_text:
+                midpoint = float(price_text.group(1)) / 100
+                return midpoint, midpoint  # Bid/Ask same if no spread visible
         
         return 0.0, 0.0
-    except:
+    except Exception as e:
+        st.warning(f"Scrape error for {url}: {e}")
         return 0.0, 0.0
 
 def fetch_data():
     candidates = []
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    progress = st.progress(0)
     
     for i, (name, url) in enumerate(MARKET_URLS.items()):
-        status_text.text(f"Scraping {name}...")
-        buy_price, sell_price = scrape_market(url)
+        with st.spinner(f"Scraping {name}..."):
+            buy_price, sell_price = scrape_market(url)
         
         candidates.append({
             'name': name,
             'buy_price': buy_price,
             'sell_price': sell_price,
-            'volume': 0,  # Volume from API if needed later
-            'source': 'LIVE Trading Page'
+            'volume': 0,  # Add Gamma API if needed
+            'source': 'Live Page Scrape'
         })
         
-        progress_bar.progress((i + 1) / len(MARKET_URLS))
+        progress.progress((i + 1) / len(MARKET_URLS))
     
-    status_text.text('Done!')
     return candidates
 
 # MAIN
-st.title("Polymarket Portugal - LIVE Trading Monitor")
-st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
+st.title("🇵🇹 Polymarket Portugal - Live Trading Arb Monitor")
+st.caption(f"Last Update: {datetime.now().strftime('%H:%M:%S')}")
 
-with st.spinner("Scraping LIVE bid/ask from Polymarket.com..."):
+debug = st.checkbox("Debug: Show Scrape Logs", value=False)
+
+with st.spinner("Scraping live bid/ask from Polymarket pages..."):
     data = fetch_data()
 
 if not data:
-    st.error("Failed to load - retry")
+    st.error("Failed to scrape - check URLs or retry")
     st.stop()
 
 data.sort(key=lambda x: x['buy_price'], reverse=True)
 
-# METRICS
+# CANDIDATE METRICS
+st.subheader("Live Prices (100 Shares Each)")
 cols = st.columns(4)
-total_buy_cost = 0
-total_sell_proceeds = 0
+total_buy = 0
+total_sell = 0
 
 for i, d in enumerate(data):
     with cols[i]:
         st.markdown(f"**{d['name'].split()[-1]}**")
+        st.caption(f"{d['name']} | {d['source']}")
         
         buy_pct = d['buy_price'] * 100
         sell_pct = d['sell_price'] * 100
         
-        st.metric("BUY (Ask)", f"{buy_pct:.1f}%")
-        st.metric("SELL (Bid)", f"{sell_pct:.1f}%")
+        st.metric("Buy (Ask)", f"{buy_pct:.2f}%")
+        st.metric("Sell (Bid)", f"{sell_pct:.2f}%")
         
-        total_buy_cost += d['buy_price']
-        total_sell_proceeds += d['sell_price']
+        total_buy += d['buy_price']
+        total_sell += d['sell_price']
 
 # BASKET TOTALS
 st.divider()
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("TOTAL BUY BASKET", f"${total_buy_cost*100:.1f}", f"{total_buy_cost*100-100:+.1f}%")
+    delta_buy = total_buy * 100 - 100
+    st.metric("🔴 Basket Buy Cost", f"{total_buy * 100:.2f}%", delta=f"{delta_buy:+.2f}% vs 100%")
 with col2:
-    st.metric("TOTAL SELL BASKET", f"${total_sell_proceeds*100:.1f}", f"{total_sell_proceeds*100-100:+.1f}%")
+    delta_sell = total_sell * 100 - 100
+    st.metric("🟢 Basket Sell Value", f"{total_sell * 100:.2f}%", delta=f"{delta_sell:+.2f}% vs 100%")
+with col3:
+    spread = (total_buy - total_sell) * 100
+    st.metric("📊 Avg Spread", f"{spread:.2f}%")
 
-# ARB CALC
-st.subheader("🤑 ARBITRAGE")
-basket_cost = total_buy_cost * 100
-basket_value = total_sell_proceeds * 100
+# ARBITRAGE
+st.subheader("💰 Arbitrage Alert")
+basket_cost = total_buy * 100
+basket_value = total_sell * 100
+spread_total = (basket_cost - basket_value)
 
 if basket_cost < 100:
-    profit_pct = 100 - basket_cost
-    st.success(f"🟢 **BUY BASKET NOW**: Cost ${basket_cost:.1f} → **{profit_pct:.1f}% INSTANT PROFIT**")
+    profit = 100 - basket_cost
+    st.success(f"🟢 **BUY BASKET ARB**: Buy all 4 for ${basket_cost:.2f} (profit **{profit:.2f}%**) - Execute NOW!")
 elif basket_value > 100:
-    profit_pct = basket_value - 100
-    st.success(f"🔴 **SELL BASKET NOW**: Value ${basket_value:.1f} → **{profit_pct:.1f}% INSTANT PROFIT**")
+    profit = basket_value - 100
+    st.success(f"🔴 **SELL BASKET ARB**: Sell all 4 for ${basket_value:.2f} (profit **{profit:.2f}%**) - Execute NOW!")
 else:
-    st.info("⚖️ Balanced - Wait for mispricing")
+    st.info(f"⚖️ Balanced (spread {spread_total:.2f}%) - No arb, but monitor for shifts")
 
 # CHART
-st.subheader("LIVE Bid/Ask Spreads")
-buy_data = [d['buy_price']*100 for d in data]
-sell_data = [d['sell_price']*100 for d in data]
-candidates = [d['name'].split()[-1] for d in data]
-
+st.subheader("Live Bid/Ask Spreads")
 chart_data = pd.DataFrame({
-    candidates[0]: [buy_data[0], sell_data[0]],
-    candidates[1]: [buy_data[1], sell_data[1]],
-    candidates[2]: [buy_data[2], sell_data[2]],
-    candidates[3]: [buy_data[3], sell_data[3]]
-}, index=['Buy', 'Sell'])
+    [d['name'].split()[-1] for d in data]: [d['buy_price']*100 for d in data],
+    [d['name'].split()[-1] for d in data]: [d['sell_price']*100 for d in data]
+}).T
+chart_data.columns = ['Buy (Ask)', 'Sell (Bid)']
+st.bar_chart(chart_data)
 
-st.bar_chart(chart_data, height=350)
-
-# TRADE TABLE
-st.subheader("TRADE EXECUTION")
+# TABLE
+st.subheader("Trade Execution Table")
 table_data = []
 for d in data:
     table_data.append({
         'Candidate': d['name'],
-        'BUY @': f"{d['buy_price']*100:.2f}%",
-        'SELL @': f"{d['sell_price']*100:.2f}%", 
-        'SPREAD': f"{(d['buy_price']-d['sell_price'])*100:.2f}%"
+        'Buy @ %': f"{d['buy_price']*100:.2f}",
+        'Sell @ %': f"{d['sell_price']*100:.2f}",
+        'Spread %': f"{(d['buy_price'] - d['sell_price'])*100:.2f}",
+        'Cost 100 Shares': f"${d['buy_price']*100:.2f}",
+        'Value 100 Shares': f"${d['sell_price']*100:.2f}"
     })
-st.dataframe(table_data)
+st.dataframe(table_data, use_container_width=True)
 
-if st.button("🔄 REFRESH LIVE TRADING DATA"):
+if st.button("🔄 Refresh Live Data"):
     st.rerun()
