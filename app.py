@@ -4,7 +4,6 @@ import time
 import pandas as pd
 from datetime import datetime
 import re
-import plotly.graph_objects as go  # For bulletproof chart
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
@@ -167,25 +166,23 @@ elif total_sell_proceeds > 1:
 else:
     st.info("No Arb")
 
-# FIXED CHART - PLOTLY SIDE-BY-SIDE BARS (NO STACKING!)
+# FIXED CHART - NATIVE STREAMLIT SIDE-BY-SIDE
 st.subheader("100-Contract Bid/Ask Spreads")
-candidates_short = [d['name'].split()[-1] for d in data]
-buy_values = [d['buy_price']*100 for d in data]
-sell_values = [d['sell_price']*100 for d in data]
 
-fig = go.Figure(data=[
-    go.Bar(name='Buy (Ask)', x=candidates_short, y=buy_values, marker_color='red', opacity=0.7),
-    go.Bar(name='Sell (Bid)', x=candidates_short, y=sell_values, marker_color='green', opacity=0.7)
-])
+# METHOD 1: TRANSPOSITION FOR SIDE-BY-SIDE
+buy_data = [d['buy_price']*100 for d in data]
+sell_data = [d['sell_price']*100 for d in data]
+candidates = [d['name'].split()[-1] for d in data]
 
-fig.update_layout(
-    barmode='group',  # SIDE-BY-SIDE (not 'stack'!)
-    title="Buy vs Sell Prices (Red=Cost to Buy, Green=Proceeds to Sell)",
-    xaxis_title="Candidate",
-    yaxis_title="Price (%)",
-    height=350
-)
-st.plotly_chart(fig, use_container_width=True)
+# Create transposed DataFrame
+chart_data = pd.DataFrame({
+    'Gouveia': [buy_data[0], sell_data[0]],
+    'Mendes': [buy_data[1], sell_data[1]],
+    'Seguro': [buy_data[2], sell_data[2]],
+    'Ventura': [buy_data[3], sell_data[3]]
+}, index=['Buy', 'Sell'])
+
+st.bar_chart(chart_data, height=350)
 
 # TABLE
 table_data = []
@@ -194,7 +191,7 @@ for d in data:
         'Candidate': d['name'],
         'Buy %': f"{d['buy_price']*100:.2f}",
         'Sell %': f"{d['sell_price']*100:.2f}",
-        'Spread %': f"{(d['price']-d['sell_price'])*100:.2f}",
+        'Spread %': f"{(d['buy_price']-d['sell_price'])*100:.2f}",
         'Volume': f"${d['volume']:,.0f}"
     })
 st.dataframe(table_data)
