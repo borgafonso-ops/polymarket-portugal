@@ -4,13 +4,14 @@ import time
 import pandas as pd
 from datetime import datetime
 import re
+import json
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
 GAMMA_API_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_API_MARKET_URL = "https://gamma-api.polymarket.com/markets/"
-CLOB_URL = "https://clob.polymarket.com/orderbook"
-HEADERS = {'User-Agent': 'PolymarketStreamlitMonitor/2.0'}
+CLOB_PRICES_URL = "https://clob.polymarket.com/prices"  # New: Best bid/ask endpoint
+HEADERS = {'User-Agent': 'PolymarketStreamlitMonitor/2.0', 'Content-Type': 'application/json'}
 
 TARGET_CANDIDATES = {
     "Henrique Gouveia e Melo",
@@ -20,50 +21,27 @@ TARGET_CANDIDATES = {
 }
 
 @st.cache_data(ttl=10)
-def robust_fetch(url):
+def robust_fetch(url, method='GET', json_data=None):
     try:
         time.sleep(0.5)
-        resp = requests.get(url, timeout=10, headers=HEADERS)
+        if method == 'POST':
+            resp = requests.post(url, headers=HEADERS, json=json_data, timeout=10)
+        else:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
         return resp.json()
     except:
         return None
 
-def walk_orderbook(orders, size_needed, is_ask=True):
-    if not orders:
-        return 0.0
-    total_cost = 0.0
-    filled = 0.0
-    if is_ask:
-        sorted_orders = sorted(orders)  # ASC for asks
-    else:
-        sorted_orders = sorted(orders, reverse=True)  # DESC for bids
-    for price, size in sorted_orders:
-        to_fill = min(size, size_needed - filled)
-        total_cost += to_fill * price
-        filled += to_fill
-        if filled >= size_needed:
-            return total_cost / size_needed
-    return 0.0
-
-def get_orderbook_prices(token_id):
-    book = robust_fetch(f"{CLOB_URL}?token_id={token_id}")
-    if not book:
-        return 0.0, 0.0
-    
-    asks = [(float(ask['price']), float(ask['size'])) for ask in book.get('asks', []) if ask.get('price')]
-    bids = [(float(bid['price']), float(bid['size'])) for bid in book.get('bids', []) if bid.get('price')]
-    
-    buy_price = walk_orderbook(asks, 100, is_ask=True)
-    sell_price = walk_orderbook(bids, 100, is_ask=False)
-    
-    return buy_price, sell_price
-
-def safe_int(value):
-    try:
-        return int(float(value or 0))
-    except:
-        return 0
+def get_prices_from_clob(token_ids):
+    """Fetch best bid/ask for multiple tokens (per docs)."""
+    if not token_ids:
+        return {}
+    json_data = {'token_ids': token_ids}
+    data = robust_fetch(CLOB_PRICES_URL, method='POST', json_data=json_data)
+    if data:
+        return data  # {token_id: {'bid': 0.50, 'ask': 0.52}}
+    return {}
 
 def safe_float(value):
     try:
@@ -80,6 +58,8 @@ def fetch_data(debug=False):
     markets = event.get('markets', [])
     
     candidates = []
+    token_ids = []  # Collect for batch prices call
+    
     for market in markets:
         market_id = market.get('id')
         if not market_id:
@@ -93,38 +73,44 @@ def fetch_data(debug=False):
         if name not in TARGET_CANDIDATES:
             continue
         
-        volume = safe_int(market_data.get('volume'))
-        token_ids = market_data.get('clobTokenIds', [])
-        if not token_ids:
+        volume = int(market_data.get('volume') or 0)
+        token_ids_raw = market_data.get('clobTokenIds', [])
+        if not token_ids_raw:
             continue
-        yes_token = token_ids[0]
+        yes_token = token_ids_raw[0]  # Yes token
+        token_ids.append(yes_token)
         
-        buy_price, sell_price = get_orderbook_prices(yes_token)
-        
-        # PRIORITIZE CLOB IF DEPTH >0
-        if buy_price > 0 and sell_price > 0:
-            source = "CLOB (Live)"
-        else:
-            # FALLBACK: Midpoint from lastPrice + ESTIMATED SPREAD (adjusted to ±1¢ for 50/52)
-            midpoint = safe_float(market_data.get('lastPrice') or market_data.get('lastTradePrice'))
-            spread_half = 0.01  # 1¢ half-spread to match 50/52
-            buy_price = midpoint + spread_half
-            sell_price = midpoint - spread_half
-            source = "Est. Spread (Site Midpoint)"
-            if debug:
-                st.info(f"{name}: CLOB empty → Est. {midpoint*100:.1f}% ±1¢ = Buy {buy_price*100:.1f}% / Sell {sell_price*100:.1f}%")
-        
+        # Temp store
         candidates.append({
             'name': name,
-            'buy_price': buy_price,
-            'sell_price': sell_price,
             'volume': volume,
             'yes_token': yes_token,
-            'source': source
+            'midpoint': safe_float(market_data.get('lastPrice') or market_data.get('lastTradePrice'))
         })
         
         if len(candidates) == 4:
             break
+    
+    # BATCH FETCH REAL BID/ASK
+    clob_prices = get_prices_from_clob(token_ids)
+    if debug:
+        st.info(f"CLOB Response: {json.dumps(clob_prices, indent=2)}")
+    
+    for i, cand in enumerate(candidates):
+        token = cand['yes_token']
+        if token in clob_prices:
+            buy_price = safe_float(clob_prices[token].get('ask', 0))
+            sell_price = safe_float(clob_prices[token].get('bid', 0))
+            source = "CLOB (Real Bid/Ask)"
+        else:
+            buy_price = sell_price = cand['midpoint']
+            source = "Midpoint (No Book Data - Check API)"
+            if debug:
+                st.warning(f"{cand['name']}: No CLOB data for {token}")
+        
+        candidates[i]['buy_price'] = buy_price
+        candidates[i]['sell_price'] = sell_price
+        candidates[i]['source'] = source
     
     return candidates
 
@@ -138,13 +124,13 @@ def extract_candidate_name(question):
 st.title("Polymarket Portugal - 100 Contract Basket Arb")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-debug = st.checkbox("Debug: Show CLOB Fallbacks & Token IDs", value=False)
+debug = st.checkbox("Debug: Show CLOB Response & Tokens", value=False)
 
-with st.spinner("Fetching LIVE orderbooks..."):
+with st.spinner("Fetching real bid/ask from CLOB..."):
     data = fetch_data(debug=debug)
 
 if not data:
-    st.error("No data")
+    st.error("No data - retry or check API status")
     st.stop()
 
 data.sort(key=lambda x: x['buy_price'], reverse=True)
@@ -180,4 +166,45 @@ with col2:
 with col3:
     st.metric("TOTAL SPREAD", f"{(total_buy_cost-total_sell_proceeds)*100:.1f}%")
 
-# ARB ALERT
+# ARB
+st.subheader("ARBITRAGE")
+if total_buy_cost < 1:
+    profit = 100 - total_buy_cost * 100
+    st.success(f"🟢 **BUY BASKET**: ${total_buy_cost*100:.1f} → **{profit:.1f}% PROFIT**")
+elif total_sell_proceeds > 1:
+    profit = total_sell_proceeds * 100 - 100
+    st.success(f"🔴 **SELL BASKET**: ${total_sell_proceeds*100:.1f} → **{profit:.1f}% PROFIT**")
+else:
+    st.info("⚖️ No Arb (balanced ~100%) - Monitor for deviations")
+
+# CHART
+st.subheader("100-Contract Spreads")
+buy_data = [d['buy_price']*100 for d in data]
+sell_data = [d['sell_price']*100 for d in data]
+candidates = [d['name'].split()[-1] for d in data]
+
+chart_data = pd.DataFrame({
+    candidates[0]: [buy_data[0], sell_data[0]],
+    candidates[1]: [buy_data[1], sell_data[1]],
+    candidates[2]: [buy_data[2], sell_data[2]],
+    candidates[3]: [buy_data[3], sell_data[3]]
+}, index=['Buy', 'Sell'])
+
+st.bar_chart(chart_data, height=350)
+
+# TABLE
+st.subheader("Details")
+table_data = []
+for d in data:
+    table_data.append({
+        'Candidate': d['name'],
+        'Source': d['source'],
+        'Buy %': f"{d['buy_price']*100:.2f}",
+        'Sell %': f"{d['sell_price']*100:.2f}",
+        'Spread %': f"{(d['buy_price']-d['sell_price'])*100:.2f}",
+        'Volume $': f"${d['volume']:,.0f}"
+    })
+st.dataframe(table_data)
+
+if st.button("🔄 REFRESH"):
+    st.rerun()
