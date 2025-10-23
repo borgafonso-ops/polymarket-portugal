@@ -53,14 +53,12 @@ def get_orderbook_prices(token_id):
     return walk_orderbook(asks, 100), walk_orderbook(bids, 100)
 
 def safe_int(value):
-    """Convert ANYTHING to int safely."""
     try:
         return int(float(value or 0))
     except:
         return 0
 
 def safe_float(value):
-    """Convert ANYTHING to float safely."""
     try:
         return float(value or 0)
     except:
@@ -88,17 +86,14 @@ def fetch_data():
         if name not in TARGET_CANDIDATES:
             continue
         
-        # FIXED: SAFE CONVERSION
         volume = safe_int(market_data.get('volume'))
         token_ids = market_data.get('clobTokenIds', [])
         if not token_ids:
             continue
         yes_token = token_ids[0]
         
-        # LIVE ORDERBOOK
         buy_price, sell_price = get_orderbook_prices(yes_token)
         
-        # FALLBACK
         if buy_price == 0:
             buy_price = safe_float(market_data.get('lastTradePrice') or market_data.get('lastPrice'))
         if sell_price == 0:
@@ -171,13 +166,15 @@ elif total_sell_proceeds > 1:
 else:
     st.info("No Arb")
 
-# CHART
+# FIXED CHART - SIDE-BY-SIDE BARS
+st.subheader("100-Contract Bid/Ask Spreads")
 chart_data = pd.DataFrame({
-    'Candidate': [d['name'].split()[-1] for d in data],
-    'Buy': [d['buy_price']*100 for d in data],
-    'Sell': [d['sell_price']*100 for d in data]
-}).set_index('Candidate')
-st.bar_chart(chart_data)
+    'Buy (Ask)': [d['buy_price']*100 for d in data],
+    'Sell (Bid)': [d['sell_price']*100 for d in data]
+})
+candidates_short = [d['name'].split()[-1] for d in data]
+chart_data.index = candidates_short
+st.bar_chart(chart_data, height=350)
 
 # TABLE
 table_data = []
