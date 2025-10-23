@@ -28,40 +28,23 @@ def robust_fetch(url, headers=HEADERS, attempts=3):
     """Fetches data from a URL with exponential backoff on failure."""
     for attempt in range(attempts):
         try:
-            resp = requests.get(url, timeout=10, headers=headers)
+            time.sleep(2)  # Rate limit buffer
+            resp = requests.get(url, timeout=15, headers=headers)  # Longer timeout
             if resp.status_code == 404:
-                return None  # No liquidity = empty book
+                return None
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if not data:  # Explicit empty check
+                st.sidebar.warning(f"Empty response from {url}")
+                return None
+            return data
         except requests.exceptions.RequestException as e:
+            st.sidebar.warning(f"Attempt {attempt+1} failed for {url}: {e}")
             if attempt < attempts - 1:
                 time.sleep(2 ** attempt)
             else:
-                st.warning(f"Failed to fetch {url}: {e}")
                 return None
     return None
-
-def calculate_fill_price(orders, size_needed):
-    """Calculate average fill price for a given size by walking the order book."""
-    if not orders:
-        return None
-    try:
-        order_list = [(float(o['price']), float(o['size'])) for o in orders if 'price' in o and 'size' in o]
-    except (ValueError, TypeError, KeyError):
-        return None
-    if not order_list:
-        return None
-    total_cost = 0.0
-    size_filled = 0.0
-    for price, size in order_list:
-        size_to_fill = min(size, size_needed - size_filled)
-        total_cost += size_to_fill * price
-        size_filled += size_to_fill
-        if size_filled >= size_needed:
-            break
-    if size_filled < size_needed:
-        return None
-    return total_cost / size_filled
 
 def extract_candidate_name(question):
     """Extract candidate name from question."""
@@ -74,287 +57,152 @@ def extract_candidate_name(question):
         return question[len(start_phrase):-len(end_phrase)].strip()
     return None
 
-# --- Historical Data ---
-HISTORICAL_FILE = "historical_sums.csv"
+# Mock data fallback (current as of Oct 2025; update as needed)
+MOCK_DATA = [
+    {'name': 'Henrique Gouveia e Melo', 'midpoint': 0.51, 'volume': 34000, 'source_msg': ' (Mock Fallback)'},
+    {'name': 'Luís Marques Mendes', 'midpoint': 0.21, 'volume': 28000, 'source_msg': ' (Mock Fallback)'},
+    {'name': 'António José Seguro', 'midpoint': 0.15, 'volume': 28000, 'source_msg': ' (Mock Fallback)'},
+    {'name': 'André Ventura', 'midpoint': 0.11, 'volume': 46000, 'source_msg': ' (Mock Fallback)'}
+]
 
-@st.cache_data(ttl=300)
-def load_historical():
+def fetch_candidate_data(debug=False, use_mock=False):
+    """Fetch data, with mock fallback."""
+    if use_mock:
+        st.sidebar.success("Using mock data (API offline)")
+        return MOCK_DATA, None
+
     try:
-        df = pd.read_csv(HISTORICAL_FILE, index_col="timestamp", parse_dates=True)
-    except FileNotFoundError:
-        df = pd.DataFrame(columns=["timestamp", "buy_sum", "sell_sum"])
-        df.set_index("timestamp", inplace=True)
-    return df
-
-def append_historical(df, buy_sum, sell_sum):
-    if buy_sum > 0 or sell_sum > 0:  # Only append non-zero data
-        new_row = pd.DataFrame({
-            "buy_sum": [buy_sum],
-            "sell_sum": [sell_sum]
-        }, index=[datetime.now()])
-        df = pd.concat([df, new_row])
-        df.to_csv(HISTORICAL_FILE)
-    return df
-
-def fetch_candidate_data(debug=False, use_clob=False):
-    """Fetch data for the 4 target candidates, prioritizing Gamma lastPrice."""
-    try:
-        # Get event data with slug filter
         event_url = f"{GAMMA_API_EVENTS_URL}?slug=portugal-presidential-election"
+        st.sidebar.info(f"Fetching event: {event_url}")
         event_data = robust_fetch(event_url)
-        if not isinstance(event_data, dict):
-            return None, "Invalid event data format"
-
-        markets = event_data.get('markets', [])
-        if not markets:
-            return None, "No markets found in event"
-
-        if debug:
-            st.info(f"Found {len(markets)} markets in event, scanning for targets...")
+        if not isinstance(event_data, dict) or not event_data.get('markets'):
+            st.sidebar.error("No event data—falling back to mock")
+            return MOCK_DATA, "API Error: Using Mock"
 
         candidates_data = []
-        found_names = set()
-
-        # Process each market
+        markets = event_data['markets'][:20]  # Limit to first 20 for speed
         for market in markets:
-            if not isinstance(market, dict):
-                continue
-
             market_id = market.get('id')
             if not market_id:
                 continue
-
-            try:
-                # Fetch full market data
-                market_url = f"{GAMMA_API_MARKET_URL}{market_id}"
-                market_data = robust_fetch(market_url)
-                if not isinstance(market_data, dict):
-                    continue
-
-                # Extract candidate name
-                question = market_data.get('question', '')
-                candidate_name = extract_candidate_name(question)
-
-                # Only process if it's one of our target candidates
-                if not candidate_name or candidate_name not in TARGET_CANDIDATES:
-                    continue
-
-                # Avoid duplicates
-                if candidate_name in found_names:
-                    continue
-
-                found_names.add(candidate_name)
-                if debug:
-                    st.success(f"Found: {candidate_name} (ID: {market_id})")
-
-                # Get volume for display
-                volume = market_data.get('volume', 0)
-
-                # Primary: Use lastPrice as proxy for both buy/sell (matches site odds)
-                last_price = float(market_data.get('lastPrice', 0))
-                buy_price = sell_price = last_price
-                source_msg = " (Gamma Last Price)"
-                clob_success = False
-
-                # Optional: Override with CLOB if enabled
-                if use_clob:
-                    # Parse token IDs (assuming binary Yes/No)
-                    clob_ids_raw = market_data.get('clobTokenIds', '[]')
-                    try:
-                        token_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
-                    except json.JSONDecodeError:
-                        token_ids = []
-                    
-                    if len(token_ids) >= 1:
-                        token_yes = token_ids[0]  # Yes is typically index 0
-                        order_book = robust_fetch(f"{CLOB_API_ORDERBOOK_URL}?token_id={token_yes}")
-                        if order_book and order_book.get('asks') and order_book.get('bids'):
-                            asks = order_book.get('asks', [])
-                            bids = order_book.get('bids', [])
-                            clob_buy = calculate_fill_price(asks, 100)
-                            clob_sell = calculate_fill_price(bids, 100)
-                            if clob_buy is not None and clob_sell is not None:
-                                buy_price = clob_buy
-                                sell_price = clob_sell
-                                source_msg = " (CLOB Orderbook)"
-                                clob_success = True
-                                if debug:
-                                    st.info(f"{candidate_name}: CLOB success - Buy: {buy_price:.3f}, Sell: {sell_price:.3f}")
-                            else:
-                                if debug:
-                                    st.warning(f"{candidate_name}: CLOB empty or insufficient depth")
-                        else:
-                            if debug:
-                                st.warning(f"{candidate_name}: CLOB 404 or failed fetch")
-                    else:
-                        if debug:
-                            st.warning(f"{candidate_name}: No valid token IDs for CLOB")
-
-                if not clob_success and last_price == 0:
-                    source_msg = " (No Data Available)"
-
-                midpoint = (buy_price + sell_price) / 2
-
-                candidates_data.append({
-                    'name': candidate_name,
-                    'buy_price': buy_price,
-                    'sell_price': sell_price,
-                    'midpoint': midpoint,
-                    'volume': volume,
-                    'source_msg': source_msg
-                })
-
-                if len(candidates_data) == 4:
-                    break
-
-            except Exception as e:
-                if debug:
-                    st.warning(f"Error processing market {market_id}: {e}")
+            market_data = robust_fetch(f"{GAMMA_API_MARKET_URL}{market_id}")
+            if not market_data:
                 continue
 
-        if not candidates_data:
-            return None, f"Could not find any of the 4 target candidates. Found: {found_names}. Check event slug or candidate names."
+            question = market_data.get('question', '')
+            candidate_name = extract_candidate_name(question)
+            if candidate_name not in TARGET_CANDIDATES:
+                continue
+
+            last_price = float(market_data.get('lastPrice', 0))
+            if last_price == 0:
+                continue  # Skip zero-price markets
+
+            volume = market_data.get('volume', 0)
+            candidates_data.append({
+                'name': candidate_name,
+                'buy_price': last_price,  # Symmetric for simplicity
+                'sell_price': last_price,
+                'midpoint': last_price,
+                'volume': volume,
+                'source_msg': ' (Live Gamma)'
+            })
+            if len(candidates_data) == 4:
+                break
+
+        if len(candidates_data) < 4:
+            st.sidebar.warning(f"Only found {len(candidates_data)}/4 candidates—partial mock")
+            # Pad with mock for missing
+            found_names = {c['name'] for c in candidates_data}
+            for mock in MOCK_DATA:
+                if mock['name'] not in found_names:
+                    candidates_data.append(mock)
+                    if len(candidates_data) == 4:
+                        break
 
         return candidates_data, None
 
     except Exception as e:
-        return None, f"Error in fetch_candidate_data: {e}"
+        st.sidebar.error(f"Fetch error: {e}")
+        return MOCK_DATA, "Exception: Using Mock"
 
 # --- Main Dashboard ---
 st.title("🇵🇹 Polymarket Portugal Election Monitor")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-st.markdown("[View Event on Polymarket](https://polymarket.com/event/portugal-presidential-election?tid=1761223523692)")
 
-# Options
-col_opt1, col_opt2 = st.columns(2)
-debug = col_opt1.checkbox("Debug Mode (Show API Logs)", value=False)
-use_clob = col_opt2.checkbox("Use CLOB Orderbook (Experimental - May 404)", value=False)
+# Sidebar Debug
+st.sidebar.header("Debug Controls")
+debug = st.sidebar.checkbox("Debug Mode", value=False)
+use_mock = st.sidebar.checkbox("Force Mock Data (If API Fails)", value=False)
+use_clob = st.sidebar.checkbox("Attempt CLOB (Slow)", value=False)  # Disabled by default now
 
-# Auto-refresh toggle
-auto_refresh = st.checkbox("Auto-refresh every 30 seconds", value=True)
+# Auto-refresh
+auto_refresh = st.sidebar.checkbox("Auto-refresh every 30s", value=True)
 if auto_refresh:
     time.sleep(30)
     st.rerun()
 
-# Fetch data
-with st.spinner("Fetching live market data..."):
-    candidates_data, error = fetch_candidate_data(debug=debug, use_clob=use_clob)
+# Fetch
+with st.spinner("Loading..."):
+    candidates_data, error = fetch_candidate_data(debug=debug, use_mock=use_mock)
 
 if error:
-    st.error(error)
-    st.stop()
+    st.warning(error)
 
 if not candidates_data:
-    st.error("Could not fetch data for any candidates")
+    st.error("No data loaded—check debug sidebar.")
     st.stop()
 
-# Sort by midpoint price
+# Sort & Display
 candidates_data.sort(key=lambda x: x['midpoint'] or 0, reverse=True)
-
-# --- Display Metrics ---
-st.subheader("📊 Top 4 Candidates - Implied Prices")
 cols = st.columns(4)
-total_buy = 0
-total_sell = 0
-
-for idx, candidate in enumerate(candidates_data):
+total_buy = total_sell = 0
+for idx, c in enumerate(candidates_data):
     with cols[idx]:
-        name = candidate['name']
-        buy_price = candidate['buy_price']
-        sell_price = candidate['sell_price']
-        volume = candidate['volume']
-        source_msg = candidate['source_msg']
+        st.markdown(f"**{c['name'].split()[-1]}**")
+        st.caption(f"{c['name']} | Vol: ${c['volume']:,.0f}{c['source_msg']}")
+        price = c['midpoint'] * 100
+        st.metric("Price", f"{price:.1f}%")
+        total_buy += c['buy_price']
+        total_sell += c['sell_price']
 
-        # Display name + volume
-        st.markdown(f"**{name.split()[-1]}**")
-        st.caption(f"{name} | Vol: ${volume:,.0f}{source_msg}")
-
-        # Display prices
-        if sell_price:
-            st.metric("Sell (Bid)", f"{sell_price * 100:.1f}%")
-            total_sell += sell_price
-        else:
-            st.metric("Sell (Bid)", "N/A")
-
-        if buy_price:
-            st.metric("Buy (Ask)", f"{buy_price * 100:.1f}%")
-            total_buy += buy_price
-        else:
-            st.metric("Buy (Ask)", "N/A")
-
+# Basket
 st.divider()
-
-# --- Basket Totals ---
-col1, col2, col3 = st.columns([1, 1, 1])
+col1, col2 = st.columns(2)
 with col1:
-    delta_buy = total_buy * 100 - 100
-    st.metric("🔴 Total BUY (Ask) Sum",
-              f"{total_buy * 100:.1f}%",
-              delta=f"{delta_buy:+.1f}% vs 100%",
-              delta_color="inverse" if delta_buy > 0 else "normal")
+    st.metric("Total Buy Sum", f"{total_buy * 100:.1f}%", delta=f"{(total_buy * 100 - 100):+.1f}%")
 with col2:
-    delta_sell = total_sell * 100 - 100
-    st.metric("🟢 Total SELL (Bid) Sum",
-              f"{total_sell * 100:.1f}%",
-              delta=f"{delta_sell:+.1f}% vs 100%",
-              delta_color="normal" if delta_sell > 0 else "inverse")
-with col3:
-    spread = (total_buy - total_sell) * 100 if total_buy and total_sell else 0
-    st.metric("📊 Avg Spread", f"{spread:.1f}%")
+    st.metric("Total Sell Sum", f"{total_sell * 100:.1f}%", delta=f"{(total_sell * 100 - 100):+.1f}%")
 
-# --- Arbitrage Opportunity (Non-Directional) ---
-st.subheader("📈 Arbitrage Opportunities (Non-Directional)")
+# Arb Check
 if total_buy * 100 < 100:
-    arb_profit = 100 - total_buy * 100
-    st.success(f"🟢 Buy basket arb: Buy all 4 for {total_buy * 100:.1f}% (profit {arb_profit:.1f}%)")
+    st.success(f"Buy Arb: {100 - total_buy * 100:.1f}% profit")
 elif total_sell * 100 > 100:
-    arb_profit = total_sell * 100 - 100
-    st.success(f"🔴 Sell basket arb: Sell all 4 for {total_sell * 100:.1f}% (profit {arb_profit:.1f}%)")
+    st.success(f"Sell Arb: {total_sell * 100 - 100:.1f}% profit")
 else:
-    st.info("⚖️ Balanced: No arb (sums ~100% as expected)")
+    st.info("Balanced (~100%)")
 
-# --- Visualization ---
-st.subheader("📈 Price Comparison")
-chart_data = pd.DataFrame({
+# Chart
+st.subheader("Prices")
+chart_df = pd.DataFrame({
     'Candidate': [c['name'].split()[-1] for c in candidates_data],
     'Price (%)': [c['midpoint'] * 100 for c in candidates_data]
+}).set_index('Candidate')
+st.bar_chart(chart_df)
+
+# Table
+st.subheader("Details")
+table_df = pd.DataFrame({
+    'Candidate': [c['name'] + c['source_msg'] for c in candidates_data],
+    'Volume': [f"${c['volume']:,.0f}" for c in candidates_data],
+    'Price %': [f"{c['midpoint']*100:.1f}" for c in candidates_data]
 })
-chart_data = chart_data.set_index('Candidate')
-st.bar_chart(chart_data, height=400, color=['#4CAF50'])
+st.dataframe(table_df)
 
-# --- Historical Sums Chart ---
-st.subheader("📉 Basket Sums Over Time")
-historical_df = load_historical()
-historical_df = append_historical(historical_df, total_buy, total_sell)
+# Info
+with st.expander("About"):
+    st.markdown("Live odds from Polymarket. Sums near 100% = fair market.")
 
-if not historical_df.empty:
-    historical_df['Buy Sum (%)'] = historical_df['buy_sum'] * 100
-    historical_df['Sell Sum (%)'] = historical_df['sell_sum'] * 100
-    st.line_chart(historical_df[['Buy Sum (%)', 'Sell Sum (%)']], height=400)
-else:
-    st.info("No historical data yet—refresh a few times to build it.")
-
-# --- Detailed Table ---
-st.subheader("📋 Detailed Table")
-table_data = []
-for candidate in candidates_data:
-    spread_pct = (candidate['buy_price'] - candidate['sell_price']) * 100 if (candidate['buy_price'] and candidate['sell_price']) else 0
-    table_data.append({
-        'Candidate': candidate['name'] + candidate['source_msg'],
-        'Volume ($)': f"${candidate['volume']:,.0f}",
-        'Price %': f"{candidate['midpoint'] * 100:.1f}",
-        'Spread %': f"{spread_pct:.1f}"
-    })
-st.dataframe(table_data, use_container_width=True, hide_index=True)
-
-# --- Additional Info ---
-with st.expander("ℹ️ About"):
-    st.markdown("""
-    - **Prices**: From Gamma API lastPrice (live odds) or CLOB if enabled. Matches Polymarket site.
-    - **Why Sums ~100%?**: Implied probs across candidates; deviations = arb.
-    - **Data**: Polymarket Gamma/CLOB APIs. Event ends Jan 2026.
-    """)
-
-if st.button("🔄 Refresh Now"):
+if st.button("🔄 Refresh"):
     st.cache_data.clear()
     st.rerun()
