@@ -74,6 +74,27 @@ def extract_candidate_name(question):
         return question[len(start_phrase):-len(end_phrase)].strip()
     return None
 
+# --- Historical Data ---
+HISTORICAL_FILE = "historical_sums.csv"
+
+@st.cache_data(ttl=300)
+def load_historical():
+    try:
+        df = pd.read_csv(HISTORICAL_FILE, index_col="timestamp", parse_dates=True)
+    except FileNotFoundError:
+        df = pd.DataFrame(columns=["timestamp", "buy_sum", "sell_sum"])
+        df.set_index("timestamp", inplace=True)
+    return df
+
+def append_historical(df, buy_sum, sell_sum):
+    new_row = pd.DataFrame({
+        "buy_sum": [buy_sum],
+        "sell_sum": [sell_sum]
+    }, index=[datetime.now()])
+    df = pd.concat([df, new_row])
+    df.to_csv(HISTORICAL_FILE)
+    return df
+
 def fetch_candidate_data():
     """Fetch order book data for the 4 target candidates."""
     try:
@@ -146,20 +167,38 @@ def fetch_candidate_data():
                     st.warning(f"Invalid token IDs for {candidate_name}")
                     continue
 
-                token_id = token_ids[yes_idx]
+                token_yes = token_ids[yes_idx]
+                token_no = token_ids[1 - yes_idx] if len(token_ids) > 1 - yes_idx else None
 
-                # Fetch order book
-                orderbook_url = f"{CLOB_API_ORDERBOOK_URL}?token_id={token_id}"
-                order_book = robust_fetch(orderbook_url)
-
-                if not order_book:
-                    st.info(f"{candidate_name}: Low liquidity")
-                    buy_price = sell_price = 0
-                else:
+                # Try Yes first, fallback to No if 404 or empty
+                order_book = robust_fetch(f"{CLOB_API_ORDERBOOK_URL}?token_id={token_yes}")
+                if order_book:
                     asks = order_book.get('asks', [])
                     bids = order_book.get('bids', [])
                     buy_price = calculate_fill_price(asks, 100)
                     sell_price = calculate_fill_price(bids, 100)
+                else:
+                    st.info(f"{candidate_name}: Low liquidity on Yes, trying No...")
+                    buy_price = sell_price = None
+
+                # Fallback to No and invert
+                if buy_price is None or sell_price is None:
+                    if token_no:
+                        order_book_no = robust_fetch(f"{CLOB_API_ORDERBOOK_URL}?token_id={token_no}")
+                        if order_book_no:
+                            asks_no = order_book_no.get('asks', [])
+                            bids_no = order_book_no.get('bids', [])
+                            buy_no = calculate_fill_price(asks_no, 100)
+                            sell_no = calculate_fill_price(bids_no, 100)
+                            if buy_no:
+                                buy_price = 1 - buy_no
+                            if sell_no:
+                                sell_price = 1 - sell_no
+                        else:
+                            st.info(f"{candidate_name}: Low liquidity on No too")
+                            buy_price = sell_price = 0
+                    else:
+                        buy_price = sell_price = 0
 
                 midpoint = (buy_price + sell_price) / 2 if (buy_price or sell_price) else 0
 
@@ -185,26 +224,6 @@ def fetch_candidate_data():
     except Exception as e:
         return None, f"Error in fetch_candidate_data: {e}"
 
-# --- Historical Data ---
-HISTORICAL_FILE = "historical_sums.csv"
-
-def load_historical():
-    try:
-        df = pd.read_csv(HISTORICAL_FILE, index_col="timestamp", parse_dates=True)
-    except FileNotFoundError:
-        df = pd.DataFrame(columns=["buy_sum", "sell_sum"])
-        df.index.name = "timestamp"
-    return df
-
-def append_historical(df, buy_sum, sell_sum):
-    new_row = pd.DataFrame({
-        "buy_sum": [buy_sum],
-        "sell_sum": [sell_sum]
-    }, index=[datetime.now()])
-    df = pd.concat([df, new_row])
-    df.to_csv(HISTORICAL_FILE)
-    return df
-
 # --- Main Dashboard ---
 st.title("🇵🇹 Polymarket Portugal Election Monitor")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -228,8 +247,7 @@ if not candidates_data:
     st.stop()
 
 # Sort by midpoint price
-data = candidates_data
-data.sort(key=lambda x: x['midpoint'] or 0, reverse=True)
+candidates_data.sort(key=lambda x: x['midpoint'] or 0, reverse=True)
 
 # --- Display Metrics ---
 st.subheader("📊 Top 4 Candidates - 100 Contract Prices")
@@ -237,7 +255,7 @@ cols = st.columns(4)
 total_buy = 0
 total_sell = 0
 
-for idx, candidate in enumerate(data):
+for idx, candidate in enumerate(candidates_data):
     with cols[idx]:
         name = candidate['name']
         buy_price = candidate['buy_price']
@@ -294,9 +312,9 @@ else:
 # --- Visualization ---
 st.subheader("📈 Price Comparison")
 chart_data = pd.DataFrame({
-    'Candidate': [c['name'].split()[-1] for c in data],
-    'Sell (Bid)': [c['sell_price'] * 100 if c['sell_price'] else 0 for c in data],
-    'Buy (Ask)': [c['buy_price'] * 100 if c['buy_price'] else 0 for c in data]
+    'Candidate': [c['name'].split()[-1] for c in candidates_data],
+    'Sell (Bid)': [c['sell_price'] * 100 if c['sell_price'] else 0 for c in candidates_data],
+    'Buy (Ask)': [c['buy_price'] * 100 if c['buy_price'] else 0 for c in candidates_data]
 })
 chart_data = chart_data.set_index('Candidate')
 st.bar_chart(chart_data, height=400, color=['#90EE90', '#FF6B6B'])
@@ -316,7 +334,7 @@ else:
 # --- Detailed Table ---
 st.subheader("📋 Detailed Price Table")
 table_data = []
-for candidate in data:
+for candidate in candidates_data:
     spread_pct = (candidate['buy_price'] - candidate['sell_price']) * 100 if (candidate['buy_price'] and candidate['sell_price']) else None
     table_data.append({
         'Candidate': candidate['name'],
