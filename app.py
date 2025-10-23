@@ -48,7 +48,7 @@ def walk_orderbook(orders, size_needed, is_ask=True):
 
 def get_orderbook_prices(token_id):
     book = robust_fetch(f"{CLOB_URL}?token_id={token_id}")
-    if not book or not book.get('asks') or not book.get('bids'):
+    if not book:
         return 0.0, 0.0
     
     asks = [(float(ask['price']), float(ask['size'])) for ask in book.get('asks', []) if ask.get('price')]
@@ -105,14 +105,14 @@ def fetch_data(debug=False):
         if buy_price > 0 and sell_price > 0:
             source = "CLOB (Live)"
         else:
-            # FALLBACK: Midpoint from lastPrice + ESTIMATED SPREAD (your 50/52 example → ±0.5%)
+            # FALLBACK: Midpoint from lastPrice + ESTIMATED SPREAD (adjusted to ±1¢ for 50/52)
             midpoint = safe_float(market_data.get('lastPrice') or market_data.get('lastTradePrice'))
-            spread_half = 0.005  # 0.5% half-spread (adjustable)
+            spread_half = 0.01  # 1¢ half-spread to match 50/52
             buy_price = midpoint + spread_half
             sell_price = midpoint - spread_half
             source = "Est. Spread (Site Midpoint)"
             if debug:
-                st.info(f"{name}: CLOB empty → Est. {midpoint*100:.1f}% ±0.5% = Buy {buy_price*100:.1f}% / Sell {sell_price*100:.1f}%")
+                st.info(f"{name}: CLOB empty → Est. {midpoint*100:.1f}% ±1¢ = Buy {buy_price*100:.1f}% / Sell {sell_price*100:.1f}%")
         
         candidates.append({
             'name': name,
@@ -167,7 +167,7 @@ for i, d in enumerate(data):
         st.metric("Sell", f"{sell_pct:.1f}%")
         st.caption(f"Spread: {spread_pct:.1f}%")
         
-        total_buy_cost += d['price']
+        total_buy_cost += d['buy_price']
         total_sell_proceeds += d['sell_price']
 
 # BASKET
@@ -180,45 +180,4 @@ with col2:
 with col3:
     st.metric("TOTAL SPREAD", f"{(total_buy_cost-total_sell_proceeds)*100:.1f}%")
 
-# ARB ALERTS
-st.subheader("ARBITRAGE")
-if total_buy_cost < 1:
-    profit = 100 - total_buy_cost * 100
-    st.success(f"🟢 **BUY BASKET**: ${total_buy_cost*100:.1f} → **{profit:.1f}% PROFIT**")
-elif total_sell_proceeds > 1:
-    profit = total_sell_proceeds * 100 - 100
-    st.success(f"🔴 **SELL BASKET**: ${total_sell_proceeds*100:.1f} → **{profit:.1f}% PROFIT**")
-else:
-    st.info("⚖️ No Arb Opportunity (balanced ~100%)")
-
-# CHART - SIDE-BY-SIDE
-st.subheader("100-Contract Spreads")
-buy_data = [d['buy_price']*100 for d in data]
-sell_data = [d['sell_price']*100 for d in data]
-candidates = [d['name'].split()[-1] for d in data]
-
-chart_data = pd.DataFrame({
-    candidates[0]: [buy_data[0], sell_data[0]],
-    candidates[1]: [buy_data[1], sell_data[1]],
-    candidates[2]: [buy_data[2], sell_data[2]],
-    candidates[3]: [buy_data[3], sell_data[3]]
-}, index=['Buy', 'Sell'])
-
-st.bar_chart(chart_data, height=350)
-
-# DETAILED TABLE
-st.subheader("Orderbook Details")
-table_data = []
-for d in data:
-    table_data.append({
-        'Candidate': d['name'],
-        'Source': d['source'],
-        'Buy %': f"{d['buy_price']*100:.2f}",
-        'Sell %': f"{d['sell_price']*100:.2f}",
-        'Spread %': f"{(d['buy_price']-d['sell_price'])*100:.2f}",
-        'Volume $': f"${d['volume']:,.0f}"
-    })
-st.dataframe(table_data)
-
-if st.button("🔄 REFRESH LIVE"):
-    st.rerun()
+# ARB ALERT
