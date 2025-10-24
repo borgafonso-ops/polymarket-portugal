@@ -1,8 +1,5 @@
 streamlit
 requests
-pandas
 beautifulsoup4
-lxml
-selenium
-webdriver-manager
+pandas
 playwright
