@@ -3,8 +3,3 @@ requests
 beautifulsoup4
 pandas
 playwright
-```
-
-Then create a new file called `packages.txt` in your repo root with:
-```
-chromium-browser
