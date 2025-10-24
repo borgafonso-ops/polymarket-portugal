@@ -10,34 +10,40 @@ st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 CLOB_API = "https://clob.polymarket.com"
 
 CANDIDATES = {
-    "Henrique Gouveia e Melo": "Henrique Gouveia e Melo",
-    "Luís Marques Mendes": "Luís Marques Mendes",
-    "António José Seguro": "António José Seguro",
-    "André Ventura": "André Ventura"
+    "Henrique Gouveia e Melo": "portugal presidential",
+    "Luís Marques Mendes": "portugal presidential",
+    "António José Seguro": "portugal presidential",
+    "André Ventura": "portugal presidential"
 }
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 }
 
-def search_market(candidate_name):
-    """Search for market by candidate name"""
+def search_all_markets():
+    """Fetch all portugal presidential markets"""
     try:
         resp = requests.get(
             f"{CLOB_API}/markets",
-            params={"search": candidate_name},
+            params={"search": "portugal presidential", "limit": 100},
             headers=HEADERS,
             timeout=10
         )
         resp.raise_for_status()
         markets = resp.json()
-        
-        if markets and len(markets) > 0:
-            return markets[0]  # Return first matching market
-        return None
+        return markets if isinstance(markets, list) else []
     except Exception as e:
-        st.warning(f"Search error for {candidate_name}: {e}")
-        return None
+        st.error(f"Market search error: {e}")
+        return []
+
+def find_candidate_market(candidate_name, all_markets):
+    """Find market for specific candidate from all markets"""
+    for market in all_markets:
+        market_question = market.get("question", "").lower()
+        candidate_lower = candidate_name.lower()
+        if candidate_lower in market_question:
+            return market
+    return None
 
 def get_orderbook(market_id):
     """Fetch bid/ask prices from orderbook"""
@@ -63,7 +69,6 @@ def get_orderbook(market_id):
         
         return bid, ask
     except Exception as e:
-        st.warning(f"Orderbook error for {market_id}: {e}")
         return 0.0, 0.0
 
 def fetch_data():
@@ -71,9 +76,16 @@ def fetch_data():
     candidates = []
     progress = st.progress(0)
     
-    for i, (display_name, search_name) in enumerate(CANDIDATES.items()):
-        # Search for market
-        market = search_market(search_name)
+    # Fetch all markets once
+    all_markets = search_all_markets()
+    
+    if not all_markets:
+        st.error("Could not fetch markets from API")
+        return candidates
+    
+    for i, display_name in enumerate(CANDIDATES.keys()):
+        # Find market for this candidate
+        market = find_candidate_market(display_name, all_markets)
         
         if market:
             market_id = market.get("id")
@@ -88,7 +100,7 @@ def fetch_data():
         })
         
         progress.progress((i + 1) / len(CANDIDATES))
-        time.sleep(0.5)  # Rate limiting
+        time.sleep(0.3)
     
     return candidates
 
@@ -98,6 +110,11 @@ st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
 with st.spinner("Fetching LIVE bid/offer from Polymarket API..."):
     data = fetch_data()
+
+# Show debug info
+with st.expander("Debug Info"):
+    for d in data:
+        st.write(f"{d['name']}: Bid={d['bid']}, Ask={d['ask']}")
 
 data.sort(key=lambda x: x['ask'], reverse=True)
 
@@ -128,14 +145,14 @@ with col2:
 
 # ARB
 st.subheader("ARBITRAGE")
-if total_ask < 1:
+if total_ask > 0 and total_ask < 1:
     profit = 100 - total_ask * 100
     st.success(f"🟢 BUY ARB: {profit:.2f}% PROFIT")
-elif total_bid > 1:
+elif total_bid > 0 and total_bid > 1:
     profit = total_bid * 100 - 100
     st.success(f"🔴 SELL ARB: {profit:.2f}% PROFIT")
 else:
-    st.info("No Arb - Prices not available")
+    st.info("No Arb - Prices not available or no opportunity")
 
 # CHART
 st.subheader("Bid/Ask Spreads")
