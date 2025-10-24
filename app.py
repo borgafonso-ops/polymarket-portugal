@@ -1,11 +1,9 @@
 import streamlit as st
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from playwright.sync_api import sync_playwright
 import pandas as pd
 from datetime import datetime
 import time
+import re
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
@@ -16,67 +14,45 @@ MARKET_URLS = {
     "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win-the-portugal-presidential-election"
 }
 
-def scrape_market_selenium(url, name):
-    """Scrape market data using Selenium"""
+def scrape_market_playwright(url, name):
+    """Scrape market data using Playwright"""
     try:
-        options = webdriver.ChromeOptions()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        
-        driver = webdriver.Chrome(options=options)
-        driver.get(url)
-        
-        # Wait for price elements to load
-        wait = WebDriverWait(driver, 15)
-        
-        bid = 0.0
-        ask = 0.0
-        
-        try:
-            # Look for bid price (usually on left side)
-            bid_elem = wait.until(
-                EC.presence_of_all_elements_located((By.XPATH, "//span[contains(text(), 'Bid') or contains(text(), 'bid')]"))
-            )
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(30000)
             
-            # Look for ask price (usually on right side)  
-            ask_elem = wait.until(
-                EC.presence_of_all_elements_located((By.XPATH, "//span[contains(text(), 'Ask') or contains(text(), 'ask')]"))
-            )
+            page.goto(url, wait_until="networkidle")
+            time.sleep(2)
             
-            # Try to extract numeric prices from text content
-            for elem in driver.find_elements(By.XPATH, "//span[@class]"):
-                text = elem.text.strip()
-                try:
-                    # Check if it's a price (contains ¢ or is a decimal between 0-1)
-                    if '¢' in text:
-                        price = float(text.replace('¢', '').strip()) / 100
-                        if 0 <= price <= 1:
-                            if bid == 0.0:
-                                bid = price
-                            else:
-                                ask = price
-                    elif text.startswith('0.') or text.startswith('1.'):
-                        price = float(text)
-                        if 0 <= price <= 1:
-                            if bid == 0.0:
-                                bid = price
-                            else:
-                                ask = price
-                except:
-                    pass
+            content = page.content()
             
-            driver.quit()
-            return bid, ask
+            prices = []
             
-        except Exception as e:
-            driver.quit()
+            matches = re.findall(r'0\.\d{2}', content)
+            prices.extend([float(m) for m in matches])
+            
+            cent_matches = re.findall(r'(\d+)¢', content)
+            prices.extend([int(m) / 100 for m in cent_matches])
+            
+            browser.close()
+            
+            if not prices:
+                return 0.0, 0.0
+            
+            prices = sorted(list(set(prices)))
+            
+            if len(prices) >= 2:
+                bid = prices[-1]
+                ask = prices[0]
+                return bid, ask
+            elif len(prices) == 1:
+                return prices[0], prices[0]
+            
             return 0.0, 0.0
             
     except Exception as e:
-        st.warning(f"{name}: Selenium error - {str(e)[:50]}")
+        st.warning(f"{name}: Error - {str(e)[:80]}")
         return 0.0, 0.0
 
 def fetch_data():
@@ -87,7 +63,7 @@ def fetch_data():
     
     for i, (name, url) in enumerate(MARKET_URLS.items()):
         status.text(f"Scraping {name}...")
-        bid, ask = scrape_market_selenium(url, name)
+        bid, ask = scrape_market_playwright(url, name)
         
         candidates.append({
             'name': name,
@@ -101,14 +77,12 @@ def fetch_data():
     status.empty()
     return candidates
 
-# MAIN
 st.title("🇵🇹 Polymarket Portugal - Bid/Offer Arb Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
 with st.spinner("Scraping LIVE bid/offer from Polymarket..."):
     data = fetch_data()
 
-# Show debug info
 with st.expander("Debug Info"):
     for d in data:
         st.write(f"**{d['name']}**: Bid={d['bid']:.4f}, Ask={d['ask']:.4f}")
@@ -119,7 +93,6 @@ if not data or all(d['ask'] == 0 for d in data):
 
 data.sort(key=lambda x: x['ask'], reverse=True)
 
-# METRICS
 cols = st.columns(4)
 total_bid = 0
 total_ask = 0
@@ -139,7 +112,6 @@ for i, d in enumerate(data):
             total_bid += d['bid']
             valid_count += 1
 
-# BASKET
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
@@ -147,7 +119,6 @@ with col1:
 with col2:
     st.metric("TOTAL BID VALUE", f"{total_bid*100:.2f}%", f"{total_bid*100-100:+.2f}%")
 
-# ARB
 st.subheader("ARBITRAGE")
 if valid_count > 0:
     if total_ask > 0 and total_ask < 1:
@@ -161,7 +132,6 @@ if valid_count > 0:
 else:
     st.warning("No valid price data available")
 
-# CHART
 st.subheader("Bid/Ask Spreads")
 if valid_count >= 2:
     candidates_short = [d['name'].split()[-1] for d in data if d['ask'] > 0]
@@ -176,7 +146,6 @@ if valid_count >= 2:
         chart_data = pd.DataFrame(chart_dict, index=['Ask', 'Bid'])
         st.bar_chart(chart_data, height=350)
 
-# TABLE
 table_data = []
 for d in data:
     table_data.append({
