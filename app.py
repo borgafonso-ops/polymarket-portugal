@@ -1,86 +1,104 @@
 import streamlit as st
-from playwright.sync_api import sync_playwright
+import requests
 import pandas as pd
 from datetime import datetime
-import time
+import json
 import re
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-MARKET_URLS = {
-    "Henrique Gouveia e Melo": "https://polymarket.com/event/portugal-presidential-election/will-henrique-gouveia-e-melo-win-the-portugal-presidential-election",
-    "Luís Marques Mendes": "https://polymarket.com/event/portugal-presidential-election/will-luis-marques-mendes-win-the-portugal-presidential-election", 
-    "António José Seguro": "https://polymarket.com/event/portugal-presidential-election/will-antonio-jose-seguro-win-the-portugal-presidential-election",
-    "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win-the-portugal-presidential-election"
-}
+CANDIDATES = [
+    {"name": "Henrique Gouveia e Melo", "id": "0x6"},
+    {"name": "Luís Marques Mendes", "id": "0x7"},
+    {"name": "António José Seguro", "id": "0x8"},
+    {"name": "André Ventura", "id": "0x9"}
+]
 
-def scrape_market_playwright(url, name):
-    """Scrape market data using Playwright"""
+def get_market_data(candidate_name):
+    """Fetch market data from Polymarket API"""
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.set_default_timeout(30000)
-            
-            page.goto(url, wait_until="networkidle")
-            time.sleep(2)
-            
-            content = page.content()
-            
-            prices = []
-            
-            matches = re.findall(r'0\.\d{2}', content)
-            prices.extend([float(m) for m in matches])
-            
-            cent_matches = re.findall(r'(\d+)¢', content)
-            prices.extend([int(m) / 100 for m in cent_matches])
-            
-            browser.close()
-            
-            if not prices:
-                return 0.0, 0.0
-            
-            prices = sorted(list(set(prices)))
-            
-            if len(prices) >= 2:
-                bid = prices[-1]
-                ask = prices[0]
-                return bid, ask
-            elif len(prices) == 1:
-                return prices[0], prices[0]
-            
+        # Search for the market
+        search_url = "https://clob.polymarket.com/markets"
+        params = {
+            "search": candidate_name,
+            "limit": 10
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        resp = requests.get(search_url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        markets = resp.json()
+        
+        if not markets or len(markets) == 0:
             return 0.0, 0.0
-            
+        
+        # Get the first matching market
+        market = markets[0]
+        market_id = market.get("id")
+        
+        if not market_id:
+            return 0.0, 0.0
+        
+        # Fetch orderbook for this market
+        orderbook_url = f"https://clob.polymarket.com/orderbook/{market_id}"
+        ob_resp = requests.get(orderbook_url, headers=headers, timeout=10)
+        ob_resp.raise_for_status()
+        
+        orderbook = ob_resp.json()
+        
+        bid = 0.0
+        ask = 0.0
+        
+        # Get best bid
+        if "bids" in orderbook and len(orderbook["bids"]) > 0:
+            bid = float(orderbook["bids"][0]["price"])
+        
+        # Get best ask
+        if "asks" in orderbook and len(orderbook["asks"]) > 0:
+            ask = float(orderbook["asks"][0]["price"])
+        
+        return bid, ask
+        
+    except requests.exceptions.Timeout:
+        st.warning(f"{candidate_name}: Request timeout")
+        return 0.0, 0.0
+    except requests.exceptions.ConnectionError:
+        st.warning(f"{candidate_name}: Connection error")
+        return 0.0, 0.0
     except Exception as e:
-        st.warning(f"{name}: Error - {str(e)[:80]}")
+        st.warning(f"{candidate_name}: {str(e)[:60]}")
         return 0.0, 0.0
 
 def fetch_data():
     """Fetch data for all candidates"""
-    candidates = []
+    data = []
     progress = st.progress(0)
     status = st.empty()
     
-    for i, (name, url) in enumerate(MARKET_URLS.items()):
-        status.text(f"Scraping {name}...")
-        bid, ask = scrape_market_playwright(url, name)
+    for i, candidate in enumerate(CANDIDATES):
+        status.text(f"Fetching {candidate['name']}...")
+        bid, ask = get_market_data(candidate['name'])
         
-        candidates.append({
-            'name': name,
+        data.append({
+            'name': candidate['name'],
             'bid': bid,
             'ask': ask
         })
         
-        progress.progress((i + 1) / len(MARKET_URLS))
-        time.sleep(1)
+        progress.progress((i + 1) / len(CANDIDATES))
     
     status.empty()
-    return candidates
+    return data
 
+# MAIN
 st.title("🇵🇹 Polymarket Portugal - Bid/Offer Arb Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-with st.spinner("Scraping LIVE bid/offer from Polymarket..."):
+with st.spinner("Fetching LIVE prices from Polymarket API..."):
     data = fetch_data()
 
 with st.expander("Debug Info"):
@@ -88,11 +106,12 @@ with st.expander("Debug Info"):
         st.write(f"**{d['name']}**: Bid={d['bid']:.4f}, Ask={d['ask']:.4f}")
 
 if not data or all(d['ask'] == 0 for d in data):
-    st.error("Could not fetch any prices. Markets may not be accessible.")
+    st.error("Could not fetch any prices from Polymarket API.")
     st.stop()
 
 data.sort(key=lambda x: x['ask'], reverse=True)
 
+# METRICS
 cols = st.columns(4)
 total_bid = 0
 total_ask = 0
@@ -112,6 +131,7 @@ for i, d in enumerate(data):
             total_bid += d['bid']
             valid_count += 1
 
+# BASKET
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
@@ -119,6 +139,7 @@ with col1:
 with col2:
     st.metric("TOTAL BID VALUE", f"{total_bid*100:.2f}%", f"{total_bid*100-100:+.2f}%")
 
+# ARB
 st.subheader("ARBITRAGE")
 if valid_count > 0:
     if total_ask > 0 and total_ask < 1:
@@ -132,6 +153,7 @@ if valid_count > 0:
 else:
     st.warning("No valid price data available")
 
+# CHART
 st.subheader("Bid/Ask Spreads")
 if valid_count >= 2:
     candidates_short = [d['name'].split()[-1] for d in data if d['ask'] > 0]
@@ -146,6 +168,7 @@ if valid_count >= 2:
         chart_data = pd.DataFrame(chart_dict, index=['Ask', 'Bid'])
         st.bar_chart(chart_data, height=350)
 
+# TABLE
 table_data = []
 for d in data:
     table_data.append({
