@@ -1,145 +1,120 @@
 import streamlit as st
-import requests
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import pandas as pd
 from datetime import datetime
 import time
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-# Polymarket CLOB API endpoints
-CLOB_API = "https://clob.polymarket.com"
-
-CANDIDATES = {
-    "Henrique Gouveia e Melo": "henrique",
-    "Luís Marques Mendes": "marques mendes",
-    "António José Seguro": "seguro",
-    "André Ventura": "ventura"
+MARKET_URLS = {
+    "Henrique Gouveia e Melo": "https://polymarket.com/event/portugal-presidential-election/will-henrique-gouveia-e-melo-win-the-portugal-presidential-election",
+    "Luís Marques Mendes": "https://polymarket.com/event/portugal-presidential-election/will-luis-marques-mendes-win-the-portugal-presidential-election", 
+    "António José Seguro": "https://polymarket.com/event/portugal-presidential-election/will-antonio-jose-seguro-win-the-portugal-presidential-election",
+    "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win-the-portugal-presidential-election"
 }
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-}
-
-def search_all_markets():
-    """Fetch all portugal presidential markets"""
+def scrape_market_selenium(url, name):
+    """Scrape market data using Selenium"""
     try:
-        resp = requests.get(
-            f"{CLOB_API}/markets",
-            params={"search": "portugal", "limit": 100},
-            headers=HEADERS,
-            timeout=10
-        )
-        resp.raise_for_status()
-        markets = resp.json()
-        return markets if isinstance(markets, list) else []
-    except Exception as e:
-        st.error(f"Market search error: {e}")
-        return []
-
-def find_candidate_market(candidate_name, candidate_keyword, all_markets):
-    """Find market for specific candidate from all markets"""
-    for market in all_markets:
-        market_question = market.get("question", "").lower()
-        # Check if both candidate name and keyword are in question
-        if candidate_keyword.lower() in market_question:
-            return market
-    return None
-
-def get_orderbook(market_id):
-    """Fetch bid/ask prices from orderbook"""
-    try:
-        resp = requests.get(
-            f"{CLOB_API}/orderbook/{market_id}",
-            headers=HEADERS,
-            timeout=10
-        )
-        resp.raise_for_status()
-        orderbook = resp.json()
+        options = webdriver.ChromeOptions()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        
+        driver = webdriver.Chrome(options=options)
+        driver.get(url)
+        
+        # Wait for price elements to load
+        wait = WebDriverWait(driver, 15)
         
         bid = 0.0
         ask = 0.0
         
-        # Get best bid (highest bid price)
-        if "bids" in orderbook and len(orderbook["bids"]) > 0:
-            bid = float(orderbook["bids"][0]["price"])
-        
-        # Get best ask (lowest ask price)
-        if "asks" in orderbook and len(orderbook["asks"]) > 0:
-            ask = float(orderbook["asks"][0]["price"])
-        
-        return bid, ask
+        try:
+            # Look for bid price (usually on left side)
+            bid_elem = wait.until(
+                EC.presence_of_all_elements_located((By.XPATH, "//span[contains(text(), 'Bid') or contains(text(), 'bid')]"))
+            )
+            
+            # Look for ask price (usually on right side)  
+            ask_elem = wait.until(
+                EC.presence_of_all_elements_located((By.XPATH, "//span[contains(text(), 'Ask') or contains(text(), 'ask')]"))
+            )
+            
+            # Try to extract numeric prices from text content
+            for elem in driver.find_elements(By.XPATH, "//span[@class]"):
+                text = elem.text.strip()
+                try:
+                    # Check if it's a price (contains ¢ or is a decimal between 0-1)
+                    if '¢' in text:
+                        price = float(text.replace('¢', '').strip()) / 100
+                        if 0 <= price <= 1:
+                            if bid == 0.0:
+                                bid = price
+                            else:
+                                ask = price
+                    elif text.startswith('0.') or text.startswith('1.'):
+                        price = float(text)
+                        if 0 <= price <= 1:
+                            if bid == 0.0:
+                                bid = price
+                            else:
+                                ask = price
+                except:
+                    pass
+            
+            driver.quit()
+            return bid, ask
+            
+        except Exception as e:
+            driver.quit()
+            return 0.0, 0.0
+            
     except Exception as e:
+        st.warning(f"{name}: Selenium error - {str(e)[:50]}")
         return 0.0, 0.0
 
 def fetch_data():
     """Fetch data for all candidates"""
     candidates = []
     progress = st.progress(0)
-    status_text = st.empty()
+    status = st.empty()
     
-    # Fetch all markets once
-    status_text.text("Fetching markets...")
-    all_markets = search_all_markets()
-    
-    status_text.text(f"Found {len(all_markets)} markets, searching for candidates...")
-    
-    if not all_markets:
-        st.error("Could not fetch markets from API")
-        return candidates
-    
-    for i, (display_name, keyword) in enumerate(CANDIDATES.items()):
-        status_text.text(f"Searching for {display_name}...")
+    for i, (name, url) in enumerate(MARKET_URLS.items()):
+        status.text(f"Scraping {name}...")
+        bid, ask = scrape_market_selenium(url, name)
         
-        # Find market for this candidate
-        market = find_candidate_market(display_name, keyword, all_markets)
+        candidates.append({
+            'name': name,
+            'bid': bid,
+            'ask': ask
+        })
         
-        if market:
-            market_id = market.get("id")
-            market_question = market.get("question", "")
-            bid, ask = get_orderbook(market_id)
-            candidates.append({
-                'name': display_name,
-                'bid': bid,
-                'ask': ask,
-                'market_id': market_id,
-                'question': market_question
-            })
-        else:
-            candidates.append({
-                'name': display_name,
-                'bid': 0.0,
-                'ask': 0.0,
-                'market_id': 'NOT FOUND',
-                'question': 'Market not found'
-            })
-        
-        progress.progress((i + 1) / len(CANDIDATES))
-        time.sleep(0.3)
+        progress.progress((i + 1) / len(MARKET_URLS))
+        time.sleep(1)
     
-    status_text.empty()
+    status.empty()
     return candidates
 
 # MAIN
 st.title("🇵🇹 Polymarket Portugal - Bid/Offer Arb Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-with st.spinner("Fetching LIVE bid/offer from Polymarket API..."):
+with st.spinner("Scraping LIVE bid/offer from Polymarket..."):
     data = fetch_data()
 
 # Show debug info
-with st.expander("Debug Info - Market Search Results"):
+with st.expander("Debug Info"):
     for d in data:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.write(f"**{d['name']}**")
-        with col2:
-            st.write(f"Market ID: {d['market_id']}")
-        with col3:
-            st.write(f"Bid: {d['bid']:.4f} | Ask: {d['ask']:.4f}")
-        st.caption(f"Question: {d['question'][:100]}...")
+        st.write(f"**{d['name']}**: Bid={d['bid']:.4f}, Ask={d['ask']:.4f}")
 
-if not data:
-    st.error("No data fetched. Check debug info above.")
+if not data or all(d['ask'] == 0 for d in data):
+    st.error("Could not fetch any prices. Markets may not be accessible.")
     st.stop()
 
 data.sort(key=lambda x: x['ask'], reverse=True)
@@ -184,7 +159,7 @@ if valid_count > 0:
     else:
         st.info("No Arb Opportunity")
 else:
-    st.warning("No valid price data available - check markets are trading")
+    st.warning("No valid price data available")
 
 # CHART
 st.subheader("Bid/Ask Spreads")
@@ -200,10 +175,6 @@ if valid_count >= 2:
         
         chart_data = pd.DataFrame(chart_dict, index=['Ask', 'Bid'])
         st.bar_chart(chart_data, height=350)
-    else:
-        st.info("No valid data to chart")
-else:
-    st.info("Need at least 2 candidates with valid prices to display chart")
 
 # TABLE
 table_data = []
@@ -212,8 +183,7 @@ for d in data:
         'Candidate': d['name'],
         'Ask %': f"{d['ask']*100:.2f}",
         'Bid %': f"{d['bid']*100:.2f}",
-        'Spread %': f"{(d['ask']-d['bid'])*100:.2f}",
-        'Market ID': d['market_id'][:12] + "..." if len(d['market_id']) > 12 else d['market_id']
+        'Spread %': f"{(d['ask']-d['bid'])*100:.2f}"
     })
 st.dataframe(table_data, use_container_width=True)
 
