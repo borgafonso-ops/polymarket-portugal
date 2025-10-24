@@ -1,76 +1,94 @@
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 from datetime import datetime
-import re
 import time
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-MARKET_URLS = {
-    "Henrique Gouveia e Melo": "https://polymarket.com/event/portugal-presidential-election/will-henrique-gouveia-e-melo-win-the-portugal-presidential-election",
-    "Luís Marques Mendes": "https://polymarket.com/event/portugal-presidential-election/will-luis-marques-mendes-win-the-portugal-presidential-election", 
-    "António José Seguro": "https://polymarket.com/event/portugal-presidential-election/will-antonio-jose-seguro-win-the-portugal-presidential-election",
-    "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win-the-portugal-presidential-election"
+# Polymarket CLOB API endpoints
+CLOB_API = "https://clob.polymarket.com"
+
+CANDIDATES = {
+    "Henrique Gouveia e Melo": "Henrique Gouveia e Melo",
+    "Luís Marques Mendes": "Luís Marques Mendes",
+    "António José Seguro": "António José Seguro",
+    "André Ventura": "André Ventura"
 }
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 }
 
-def scrape_market(url, name):
+def search_market(candidate_name):
+    """Search for market by candidate name"""
     try:
-        time.sleep(1)
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if "error" in resp.text.lower() or "issue" in resp.text.lower():
-            st.warning(f"{name}: Site error - no prices available")
-            return 0.0, 0.0
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        resp = requests.get(
+            f"{CLOB_API}/markets",
+            params={"search": candidate_name},
+            headers=HEADERS,
+            timeout=10
+        )
+        resp.raise_for_status()
+        markets = resp.json()
         
-        # Look for bid/ask in price classes or text
-        price_elems = soup.find_all(['span', 'div'], class_=re.compile(r'price|bid|ask|odds|button'))
-        prices = []
-        for elem in price_elems:
-            text = elem.text.strip()
-            # Match numbers with % or ¢
-            matches = re.findall(r'(\d+\.?\d*)([%¢$])', text)
-            for num, unit in matches:
-                price = float(num)
-                if unit == '%':
-                    price /= 100
-                elif unit in '¢$':
-                    price /= 100 if price < 1 else 1  # 50¢ = 0.50, $50 = 50%
-                prices.append(price)
-        
-        # Deduplicate and sort
-        prices = sorted(set(prices))
-        if len(prices) >= 2:
-            return prices[-1], prices[0]  # Ask (highest), Bid (lowest)
-        elif len(prices) == 1:
-            return prices[0], prices[0]  # Single price as both (rare)
-        
-        st.warning(f"{name}: No prices found - returning 0.0/0.0")
-        return 0.0, 0.0
-        
+        if markets and len(markets) > 0:
+            return markets[0]  # Return first matching market
+        return None
     except Exception as e:
-        st.warning(f"{name}: Scrape error {e} - 0.0/0.0")
+        st.warning(f"Search error for {candidate_name}: {e}")
+        return None
+
+def get_orderbook(market_id):
+    """Fetch bid/ask prices from orderbook"""
+    try:
+        resp = requests.get(
+            f"{CLOB_API}/orderbook/{market_id}",
+            headers=HEADERS,
+            timeout=10
+        )
+        resp.raise_for_status()
+        orderbook = resp.json()
+        
+        bid = 0.0
+        ask = 0.0
+        
+        # Get best bid (highest bid price)
+        if "bids" in orderbook and len(orderbook["bids"]) > 0:
+            bid = float(orderbook["bids"][0]["price"])
+        
+        # Get best ask (lowest ask price)
+        if "asks" in orderbook and len(orderbook["asks"]) > 0:
+            ask = float(orderbook["asks"][0]["price"])
+        
+        return bid, ask
+    except Exception as e:
+        st.warning(f"Orderbook error for {market_id}: {e}")
         return 0.0, 0.0
 
 def fetch_data():
+    """Fetch data for all candidates"""
     candidates = []
     progress = st.progress(0)
     
-    for i, (name, url) in enumerate(MARKET_URLS.items()):
-        buy_price, sell_price = scrape_market(url, name)
+    for i, (display_name, search_name) in enumerate(CANDIDATES.items()):
+        # Search for market
+        market = search_market(search_name)
+        
+        if market:
+            market_id = market.get("id")
+            bid, ask = get_orderbook(market_id)
+        else:
+            bid, ask = 0.0, 0.0
         
         candidates.append({
-            'name': name,
-            'buy_price': buy_price,
-            'sell_price': sell_price
+            'name': display_name,
+            'bid': bid,
+            'ask': ask
         })
         
-        progress.progress((i + 1) / 4)
+        progress.progress((i + 1) / len(CANDIDATES))
+        time.sleep(0.5)  # Rate limiting
     
     return candidates
 
@@ -78,59 +96,59 @@ def fetch_data():
 st.title("🇵🇹 Polymarket Portugal - Bid/Offer Arb Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-with st.spinner("Scraping LIVE bid/offer..."):
+with st.spinner("Fetching LIVE bid/offer from Polymarket API..."):
     data = fetch_data()
 
-data.sort(key=lambda x: x['buy_price'], reverse=True)
+data.sort(key=lambda x: x['ask'], reverse=True)
 
 # METRICS
 cols = st.columns(4)
-total_buy = 0
-total_sell = 0
+total_bid = 0
+total_ask = 0
 
 for i, d in enumerate(data):
     with cols[i]:
         st.markdown(f"**{d['name'].split()[-1]}**")
-        buy_pct = d['buy_price'] * 100
-        sell_pct = d['sell_price'] * 100
+        ask_pct = d['ask'] * 100
+        bid_pct = d['bid'] * 100
         
-        st.metric("Offer (Ask)", f"{buy_pct:.1f}%")
-        st.metric("Bid (Sell)", f"{sell_pct:.1f}%")
+        st.metric("Ask (Offer)", f"{ask_pct:.2f}%")
+        st.metric("Bid", f"{bid_pct:.2f}%")
         
-        total_buy += d['buy_price']
-        total_sell += d['sell_price']
+        total_ask += d['ask']
+        total_bid += d['bid']
 
 # BASKET
 st.divider()
 col1, col2 = st.columns(2)
 with col1:
-    st.metric("TOTAL OFFER COST", f"{total_buy*100:.1f}%", f"{total_buy*100-100:+.1f}%")
+    st.metric("TOTAL ASK COST", f"{total_ask*100:.2f}%", f"{total_ask*100-100:+.2f}%")
 with col2:
-    st.metric("TOTAL BID VALUE", f"{total_sell*100:.1f}%", f"{total_sell*100-100:+.1f}%")
+    st.metric("TOTAL BID VALUE", f"{total_bid*100:.2f}%", f"{total_bid*100-100:+.2f}%")
 
 # ARB
 st.subheader("ARBITRAGE")
-if total_buy < 1:
-    profit = 100 - total_buy * 100
-    st.success(f"🟢 BUY ARB: {profit:.1f}% PROFIT")
-elif total_sell > 1:
-    profit = total_sell * 100 - 100
-    st.success(f"🔴 SELL ARB: {profit:.1f}% PROFIT")
+if total_ask < 1:
+    profit = 100 - total_ask * 100
+    st.success(f"🟢 BUY ARB: {profit:.2f}% PROFIT")
+elif total_bid > 1:
+    profit = total_bid * 100 - 100
+    st.success(f"🔴 SELL ARB: {profit:.2f}% PROFIT")
 else:
-    st.info("No Arb - All 0.0/0.0 due to site errors")
+    st.info("No Arb - Prices not available")
 
 # CHART
-st.subheader("Bid/Offer Spreads")
+st.subheader("Bid/Ask Spreads")
 candidates_short = [d['name'].split()[-1] for d in data]
-buy_data = [d['buy_price']*100 for d in data]
-sell_data = [d['sell_price']*100 for d in data]
+ask_data = [d['ask']*100 for d in data]
+bid_data = [d['bid']*100 for d in data]
 
 chart_data = pd.DataFrame({
-    candidates_short[0]: [buy_data[0], sell_data[0]],
-    candidates_short[1]: [buy_data[1], sell_data[1]],
-    candidates_short[2]: [buy_data[2], sell_data[2]],
-    candidates_short[3]: [buy_data[3], sell_data[3]]
-}, index=['Offer', 'Bid'])
+    candidates_short[0]: [ask_data[0], bid_data[0]],
+    candidates_short[1]: [ask_data[1], bid_data[1]],
+    candidates_short[2]: [ask_data[2], bid_data[2]],
+    candidates_short[3]: [ask_data[3], bid_data[3]]
+}, index=['Ask', 'Bid'])
 
 st.bar_chart(chart_data, height=350)
 
@@ -139,11 +157,11 @@ table_data = []
 for d in data:
     table_data.append({
         'Candidate': d['name'],
-        'Offer %': f"{d['buy_price']*100:.1f}",
-        'Bid %': f"{d['sell_price']*100:.1f}",
-        'Spread': f"{(d['buy_price']-d['sell_price'])*100:.1f}%"
+        'Ask %': f"{d['ask']*100:.2f}",
+        'Bid %': f"{d['bid']*100:.2f}",
+        'Spread %': f"{(d['ask']-d['bid'])*100:.2f}"
     })
-st.dataframe(table_data)
+st.dataframe(table_data, use_container_width=True)
 
 if st.button("🔄 REFRESH"):
     st.rerun()
