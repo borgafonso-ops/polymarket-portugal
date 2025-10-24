@@ -1,11 +1,8 @@
 import streamlit as st
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
 from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import re
 import time
 
@@ -18,81 +15,71 @@ MARKET_URLS = {
     "André Ventura": "https://polymarket.com/event/portugal-presidential-election/will-andre-ventura-win-the-portugal-presidential-election"
 }
 
-def setup_driver():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(options=options)
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
 
 def scrape_market(url, name):
-    driver = None
     try:
-        driver = setup_driver()
-        driver.get(url)
+        time.sleep(1)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if "error" in resp.text.lower() or "issue" in resp.text.lower():
+            st.warning(f"{name}: Site error - no prices available")
+            return 0.0, 0.0
+        soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # Wait for price elements (YES market bid/ask)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//*[contains(@class, 'price') or contains(@class, 'bid') or contains(@class, 'ask')]"))
-        )
-        
-        # Find bid/ask elements (YES market)
-        elements = driver.find_elements(By.XPATH, "//*[contains(@class, 'price') or contains(@class, 'bid') or contains(@class, 'ask')]")
+        # Look for bid/ask in price classes or text
+        price_elems = soup.find_all(['span', 'div'], class_=re.compile(r'price|bid|ask|odds|button'))
         prices = []
-        for elem in elements:
-            text = elem.text
-            match = re.search(r'(\d+\.?\d*)[%¢$]', text)
-            if match:
-                price = float(match.group(1))
-                if '¢' in text or ('$' in text and price < 1):
-                    price /= 100  # Convert cents to decimal (50¢ = 0.50)
-                elif '%' in text:
-                    price /= 100  # Convert % to decimal (50% = 0.50)
+        for elem in price_elems:
+            text = elem.text.strip()
+            # Match numbers with % or ¢
+            matches = re.findall(r'(\d+\.?\d*)([%¢$])', text)
+            for num, unit in matches:
+                price = float(num)
+                if unit == '%':
+                    price /= 100
+                elif unit in '¢$':
+                    price /= 100 if price < 1 else 1  # 50¢ = 0.50, $50 = 50%
                 prices.append(price)
         
+        # Deduplicate and sort
+        prices = sorted(set(prices))
         if len(prices) >= 2:
-            return max(prices), min(prices)  # Buy (ask, higher), Sell (bid, lower)
-        return 0.0, 0.0  # No prices found
+            return prices[-1], prices[0]  # Ask (highest), Bid (lowest)
+        elif len(prices) == 1:
+            return prices[0], prices[0]  # Single price as both (rare)
+        
+        st.warning(f"{name}: No prices found - returning 0.0/0.0")
+        return 0.0, 0.0
         
     except Exception as e:
-        st.warning(f"Failed to scrape {name}: {e}")
+        st.warning(f"{name}: Scrape error {e} - 0.0/0.0")
         return 0.0, 0.0
-    finally:
-        if driver:
-            driver.quit()
 
 def fetch_data():
     candidates = []
     progress = st.progress(0)
     
     for i, (name, url) in enumerate(MARKET_URLS.items()):
-        with st.spinner(f"Scraping {name}..."):
-            buy_price, sell_price = scrape_market(url, name)
+        buy_price, sell_price = scrape_market(url, name)
         
         candidates.append({
             'name': name,
             'buy_price': buy_price,
-            'sell_price': sell_price,
-            'source': 'Live Selenium Scrape'
+            'sell_price': sell_price
         })
         
         progress.progress((i + 1) / 4)
-        time.sleep(1)
     
     return candidates
 
 # MAIN
-st.title("🇵🇹 Polymarket Portugal - Live Trading Arb")
+st.title("🇵🇹 Polymarket Portugal - Bid/Offer Arb Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-debug = st.checkbox("Debug: Show Scrape Errors", value=False)
-
-with st.spinner("Scraping LIVE bid/ask from Polymarket..."):
+with st.spinner("Scraping LIVE bid/offer..."):
     data = fetch_data()
-
-if not data or all(d['buy_price'] == 0.0 and d['sell_price'] == 0.0 for d in data):
-    st.error("No bid/ask data - check Polymarket site or retry")
-    st.stop()
 
 data.sort(key=lambda x: x['buy_price'], reverse=True)
 
@@ -104,40 +91,36 @@ total_sell = 0
 for i, d in enumerate(data):
     with cols[i]:
         st.markdown(f"**{d['name'].split()[-1]}**")
-        st.caption(f"{d['name'][:15]}... | {d['source']}")
-        
         buy_pct = d['buy_price'] * 100
         sell_pct = d['sell_price'] * 100
         
-        st.metric("Buy (Ask)", f"{buy_pct:.1f}%")
-        st.metric("Sell (Bid)", f"{sell_pct:.1f}%")
+        st.metric("Offer (Ask)", f"{buy_pct:.1f}%")
+        st.metric("Bid (Sell)", f"{sell_pct:.1f}%")
         
         total_buy += d['buy_price']
         total_sell += d['sell_price']
 
 # BASKET
 st.divider()
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 with col1:
-    st.metric("Buy Basket Cost", f"${total_buy*100:.1f}", f"{total_buy*100-100:+.1f}%")
+    st.metric("TOTAL OFFER COST", f"{total_buy*100:.1f}%", f"{total_buy*100-100:+.1f}%")
 with col2:
-    st.metric("Sell Basket Value", f"${total_sell*100:.1f}", f"{total_sell*100-100:+.1f}%")
-with col3:
-    st.metric("Avg Spread", f"{(total_buy-total_sell)*100:.1f}%")
+    st.metric("TOTAL BID VALUE", f"{total_sell*100:.1f}%", f"{total_sell*100-100:+.1f}%")
 
 # ARB
-st.subheader("💰 Arbitrage")
+st.subheader("ARBITRAGE")
 if total_buy < 1:
     profit = 100 - total_buy * 100
-    st.success(f"🟢 BUY BASKET: ${total_buy*100:.1f} → {profit:.1f}% PROFIT")
+    st.success(f"🟢 BUY ARB: {profit:.1f}% PROFIT")
 elif total_sell > 1:
     profit = total_sell * 100 - 100
-    st.success(f"🔴 SELL BASKET: ${total_sell*100:.1f} → {profit:.1f}% PROFIT")
+    st.success(f"🔴 SELL ARB: {profit:.1f}% PROFIT")
 else:
-    st.info("⚖️ No Arb")
+    st.info("No Arb - All 0.0/0.0 due to site errors")
 
 # CHART
-st.subheader("Live Bid/Ask Spreads")
+st.subheader("Bid/Offer Spreads")
 candidates_short = [d['name'].split()[-1] for d in data]
 buy_data = [d['buy_price']*100 for d in data]
 sell_data = [d['sell_price']*100 for d in data]
@@ -147,23 +130,20 @@ chart_data = pd.DataFrame({
     candidates_short[1]: [buy_data[1], sell_data[1]],
     candidates_short[2]: [buy_data[2], sell_data[2]],
     candidates_short[3]: [buy_data[3], sell_data[3]]
-}, index=['Buy', 'Sell'])
+}, index=['Offer', 'Bid'])
 
 st.bar_chart(chart_data, height=350)
 
 # TABLE
-st.subheader("Trade Execution")
 table_data = []
 for d in data:
     table_data.append({
         'Candidate': d['name'],
-        'Buy @': f"{d['buy_price']*100:.1f}%",
-        'Sell @': f"{d['sell_price']*100:.1f}%",
-        'Spread': f"{(d['buy_price']-d['sell_price'])*100:.1f}%",
-        'Cost (100)': f"${d['buy_price']*100:.1f}",
-        'Value (100)': f"${d['sell_price']*100:.1f}"
+        'Offer %': f"{d['buy_price']*100:.1f}",
+        'Bid %': f"{d['sell_price']*100:.1f}",
+        'Spread': f"{(d['buy_price']-d['sell_price'])*100:.1f}%"
     })
-st.dataframe(table_data, use_container_width=True)
+st.dataframe(table_data)
 
-if st.button("🔄 Refresh Live"):
+if st.button("🔄 REFRESH"):
     st.rerun()
