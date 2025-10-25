@@ -2,8 +2,16 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
+from eth_account import Account
+from eth_account.messages import encode_defunct
+import json
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
+
+# Your credentials
+PRIVATE_KEY = "0xd70383d8c5d337855f12302491c56eb86cd8f34d6cf20bfb824352d1294b8c0c"
+FUNDER = "0x0B309C3fDa618c0a9555bf23eFfB0ba75009C0B6"
+MARKET_ID = "0x2b1e18ef56cb7222ce2fb03d6cd9fb8fcca06d80b64d0dacbe6ce2f00ab31d00"
 
 CANDIDATES = [
     "Henrique Gouveia e Melo",
@@ -12,14 +20,49 @@ CANDIDATES = [
     "André Ventura"
 ]
 
-def fetch_portugal_markets():
-    """Fetch all Portugal presidential election markets"""
+def sign_message(message):
+    """Sign a message with your private key"""
+    try:
+        account = Account.from_key(PRIVATE_KEY)
+        message_hash = encode_defunct(text=message)
+        signed = account.sign_message(message_hash)
+        return signed.signature.hex()
+    except Exception as e:
+        st.error(f"Error signing message: {e}")
+        return None
+
+def fetch_orderbook(token_id):
+    """Fetch orderbook for a token using authenticated API"""
+    try:
+        url = f"https://clob.polymarket.com/orderbook/{token_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'POLY-ADDRESS': FUNDER,
+        }
+        
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        ob = resp.json()
+        
+        bid = 0.0
+        ask = 0.0
+        
+        if isinstance(ob, dict):
+            if "bids" in ob and ob["bids"]:
+                bid = float(ob["bids"][0].get("price", 0))
+            if "asks" in ob and ob["asks"]:
+                ask = float(ob["asks"][0].get("price", 0))
+        
+        return bid, ask
+    except Exception as e:
+        return 0.0, 0.0
+
+def fetch_market_with_tokens():
+    """Fetch market and token IDs"""
     try:
         url = "https://gamma-api.polymarket.com/markets"
-        params = {
-            "search": "portugal presidential",
-            "limit": 50
-        }
+        params = {"condition_ids": MARKET_ID}
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -27,83 +70,74 @@ def fetch_portugal_markets():
         resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         
-        return resp.json()
+        markets = resp.json()
+        return markets[0] if markets else None
         
     except Exception as e:
-        st.warning(f"Error fetching markets: {e}")
-        return []
+        st.error(f"Error fetching market: {e}")
+        return None
 
 def fetch_all_data():
     """Fetch data for all candidates"""
     data = []
     status = st.empty()
     
-    status.text("Searching for Portugal presidential election market...")
-    markets = fetch_portugal_markets()
+    status.text("Fetching Portugal presidential election market...")
+    market = fetch_market_with_tokens()
     
-    if not markets:
-        st.error("No markets found")
+    if not market:
+        st.error("Could not fetch market")
         return []
     
-    # Display what we found for debugging
-    st.write(f"Found {len(markets)} market(s) matching 'portugal presidential'")
+    st.write(f"✓ Market: {market.get('question', 'N/A')[:80]}...")
     
-    for market in markets:
-        question = market.get("question", "").lower()
-        
-        st.write(f"Market: {market.get('question', 'N/A')[:80]}...")
-        
-        # Check if this market has candidate outcomes
-        outcomes = market.get("outcomes", [])
-        if isinstance(outcomes, str):
-            try:
-                import json
-                outcomes = json.loads(outcomes)
-            except:
-                outcomes = []
-        
-        st.write(f"  Found {len(outcomes)} outcomes")
-        
-        # Look for candidate names in outcomes
-        matched_candidates = []
-        for outcome in outcomes:
+    # Get outcomes and token info
+    outcomes = market.get("outcomes", [])
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except:
+            outcomes = []
+    
+    # Get CLOB token IDs
+    clob_token_ids = market.get("clobTokenIds", "")
+    if isinstance(clob_token_ids, str) and clob_token_ids:
+        try:
+            token_ids = json.loads(clob_token_ids)
+        except:
+            token_ids = clob_token_ids.split(",") if "," in clob_token_ids else [clob_token_ids]
+    else:
+        token_ids = []
+    
+    st.write(f"Found {len(outcomes)} outcomes, {len(token_ids)} token IDs")
+    
+    # Fetch orderbook for each token
+    with st.spinner("Fetching live orderbooks..."):
+        for i, outcome in enumerate(outcomes):
             if isinstance(outcome, dict):
                 outcome_name = outcome.get("name", str(outcome))
             else:
                 outcome_name = str(outcome)
             
+            # Find matching candidate
+            matched_candidate = None
             for candidate in CANDIDATES:
                 if candidate.lower() in outcome_name.lower() or outcome_name.lower() in candidate.lower():
-                    matched_candidates.append({
-                        'candidate': candidate,
-                        'outcome': outcome_name,
-                        'outcome_obj': outcome
-                    })
-        
-        if len(matched_candidates) >= 4:
-            st.write(f"  ✓ This market has all 4 candidates!")
+                    matched_candidate = candidate
+                    break
             
-            # This is our market! Extract bid/ask for each
-            for match in matched_candidates:
-                candidate = match['candidate']
-                outcome = match['outcome_obj']
+            if matched_candidate and i < len(token_ids):
+                token_id = token_ids[i]
+                status.text(f"Fetching orderbook for {matched_candidate}...")
                 
-                # Try to get price data from outcome
-                bid = 0.0
-                ask = 0.0
-                
-                if isinstance(outcome, dict):
-                    # Look for bestBid/bestAsk in outcome object
-                    bid = float(outcome.get('bestBid', outcome.get('price', 0)))
-                    ask = float(outcome.get('bestAsk', outcome.get('price', 0)))
+                bid, ask = fetch_orderbook(token_id)
                 
                 data.append({
-                    'name': candidate,
+                    'name': matched_candidate,
                     'bid': bid,
-                    'ask': ask
+                    'ask': ask,
+                    'token_id': token_id
                 })
-            
-            break
     
     status.empty()
     return data
@@ -125,6 +159,7 @@ with st.expander("Debug Info"):
             st.write(f"  Bid: {d['bid']:.4f} ({d['bid']*100:.2f}%)")
             st.write(f"  Ask: {d['ask']:.4f} ({d['ask']*100:.2f}%)")
             st.write(f"  Spread: {(d['bid']-d['ask'])*100:.2f}¢")
+            st.write(f"  Token ID: {d['token_id'][:16]}...")
         
         st.write(f"\n**Totals**")
         st.write(f"  Total Bid: {total_bid:.4f} ({total_bid*100:.2f}%)")
