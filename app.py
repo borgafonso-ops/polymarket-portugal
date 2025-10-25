@@ -2,108 +2,95 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-import json
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-MARKET_ID = "0x2b1e18ef56cb7222ce2fb03d6cd9fb8fcca06d80b64d0dacbe6ce2f00ab31d00"
+MARKET_SLUGS = {
+    "Henrique Gouveia e Melo": "will-henrique-gouveia-e-melo-win-the-2026-portugal-presidential-election",
+    "Luís Marques Mendes": "will-luis-marques-mendes-win-the-2026-portugal-presidential-election",
+    "António José Seguro": "will-antonio-jose-seguro-win-the-2026-portugal-presidential-election",
+    "André Ventura": "will-andre-ventura-win-the-2026-portugal-presidential-election"
+}
 
-CANDIDATES = [
-    "Henrique Gouveia e Melo",
-    "Luís Marques Mendes", 
-    "António José Seguro",
-    "André Ventura"
-]
-
-def fetch_market_data():
+def fetch_market_data(slug):
     """Fetch market data from Polymarket API"""
     try:
-        url = f"https://clob.polymarket.com/rewards/markets/{MARKET_ID}"
+        url = "https://gamma-api.polymarket.com/markets"
+        params = {"slug": slug}
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         
-        return resp.json()
+        markets = resp.json()
+        
+        if markets and len(markets) > 0:
+            market = markets[0]
+            return {
+                'name': market.get('question', ''),
+                'bid': float(market.get('bestBid', 0)),
+                'ask': float(market.get('bestAsk', 0)),
+                'volume': market.get('volume', 0),
+                'liquidity': market.get('liquidity', 0)
+            }
+        return None
         
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
+        st.warning(f"Error fetching {slug}: {e}")
         return None
 
-def fetch_orderbook(token_id):
-    """Fetch orderbook for a specific token/outcome"""
-    try:
-        url = f"https://clob.polymarket.com/orderbook/{token_id}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+def fetch_all_data():
+    """Fetch data for all candidates"""
+    data = []
+    progress = st.progress(0)
+    status = st.empty()
+    
+    for i, (name, slug) in enumerate(MARKET_SLUGS.items()):
+        status.text(f"Fetching {name}...")
+        market = fetch_market_data(slug)
         
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
+        if market:
+            data.append({
+                'name': name,
+                'bid': market['bid'],
+                'ask': market['ask'],
+                'volume': market['volume'],
+                'liquidity': market['liquidity']
+            })
+        else:
+            data.append({
+                'name': name,
+                'bid': 0.0,
+                'ask': 0.0,
+                'volume': 0,
+                'liquidity': 0
+            })
         
-        ob = resp.json()
-        bid = 0.0
-        ask = 0.0
-        
-        if isinstance(ob, dict):
-            if "bids" in ob and ob["bids"]:
-                bid = float(ob["bids"][0].get("price", 0))
-            if "asks" in ob and ob["asks"]:
-                ask = float(ob["asks"][0].get("price", 0))
-        
-        return bid, ask
-    except:
-        return 0.0, 0.0
+        progress.progress((i + 1) / len(MARKET_SLUGS))
+    
+    status.empty()
+    return data
 
 # MAIN
 st.title("🇵🇹 Polymarket Portugal - Bid/Offer Monitor")
 st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
 
-with st.spinner("Fetching market data..."):
-    market_data = fetch_market_data()
+with st.spinner("Fetching LIVE data..."):
+    data = fetch_all_data()
 
-if not market_data:
-    st.error("Could not fetch market data")
-    st.stop()
-
-# Display raw market data for debugging
-with st.expander("Raw Market Data"):
-    st.json(market_data)
-
-# Extract token IDs and outcomes
-data = []
-
-if isinstance(market_data, dict):
-    tokens = market_data.get("tokens", [])
-    
-    with st.spinner("Fetching orderbooks..."):
-        for i, token in enumerate(tokens):
-            token_id = token.get("token_id")
-            outcome = token.get("outcome")
-            
-            if token_id and outcome and i < len(CANDIDATES):
-                bid, ask = fetch_orderbook(token_id)
-                data.append({
-                    'name': CANDIDATES[i],
-                    'outcome': outcome,
-                    'token_id': token_id,
-                    'bid': bid,
-                    'ask': ask
-                })
-
-# Debug info
 with st.expander("Debug Info"):
     if data:
         total_bid = sum(d['bid'] for d in data)
         total_ask = sum(d['ask'] for d in data)
         
         for d in data:
-            st.write(f"**{d['name']}** ({d['outcome']})")
+            st.write(f"**{d['name']}**")
             st.write(f"  Bid: {d['bid']:.4f} ({d['bid']*100:.2f}%)")
             st.write(f"  Ask: {d['ask']:.4f} ({d['ask']*100:.2f}%)")
             st.write(f"  Spread: {(d['bid']-d['ask'])*100:.2f}¢")
+            st.write(f"  Volume: ${d['volume']:,.0f}")
         
         st.write(f"\n**Totals**")
         st.write(f"  Total Bid: {total_bid:.4f} ({total_bid*100:.2f}%)")
@@ -126,7 +113,7 @@ for i, d in enumerate(data):
         
         st.metric("Bid %", f"{d['bid']*100:.2f}%")
         st.metric("Ask %", f"{d['ask']*100:.2f}%")
-        st.metric("Spread (¢)", f"{(d['bid']-d['ask'])*100:.1f}")
+        st.metric("Spread (¢)", f"{(d['bid']-d['ask'])*100:.2f}")
         
         total_bid += d['bid']
         total_ask += d['ask']
@@ -154,7 +141,8 @@ for d in data:
         'Candidate': d['name'],
         'Bid %': f"{d['bid']*100:.2f}",
         'Ask %': f"{d['ask']*100:.2f}",
-        'Spread (¢)': f"{spread:.1f}"
+        'Spread (¢)': f"{spread:.2f}",
+        'Volume': f"${d['volume']:,.0f}"
     })
 st.dataframe(table_data, use_container_width=True)
 
