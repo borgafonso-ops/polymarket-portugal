@@ -54,8 +54,8 @@ def fetch_all_data():
         if market:
             data.append({
                 'name': name,
-                'bid': market['bid'],
-                'ask': market['ask'],
+                'bid': market['ask'],  # Swap: API's bestBid is actually the ask
+                'ask': market['bid'],  # API's bestAsk is actually the bid
                 'volume': market['volume'],
                 'liquidity': market['liquidity']
             })
@@ -90,7 +90,11 @@ with st.expander("Debug Info"):
             st.write(f"  Bid: {d['bid']:.4f} ({d['bid']*100:.2f}%)")
             st.write(f"  Ask: {d['ask']:.4f} ({d['ask']*100:.2f}%)")
             st.write(f"  Spread: {(d['bid']-d['ask'])*100:.2f}¢")
-            st.write(f"  Volume: ${d['volume']:,.0f}")
+            try:
+                vol = float(d['volume']) if d['volume'] else 0
+                st.write(f"  Volume: ${vol:,.0f}")
+            except:
+                st.write(f"  Volume: {d['volume']}")
         
         st.write(f"\n**Totals**")
         st.write(f"  Total Bid: {total_bid:.4f} ({total_bid*100:.2f}%)")
@@ -137,12 +141,16 @@ with col3:
 table_data = []
 for d in data:
     spread = (d['bid'] - d['ask']) * 100
+    try:
+        vol = f"${float(d['volume']):,.0f}" if d['volume'] else "$0"
+    except:
+        vol = str(d['volume'])
     table_data.append({
         'Candidate': d['name'],
         'Bid %': f"{d['bid']*100:.2f}",
         'Ask %': f"{d['ask']*100:.2f}",
         'Spread (¢)': f"{spread:.2f}",
-        'Volume': f"${d['volume']:,.0f}"
+        'Volume': vol
     })
 st.dataframe(table_data, use_container_width=True)
 
