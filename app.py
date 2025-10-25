@@ -78,6 +78,8 @@ def fetch_all_data():
             
             # Get token IDs for the YES outcome
             clob_token_ids = market.get("clobTokenIds", "")
+            st.write(f"  Raw clobTokenIds: {clob_token_ids}")
+            
             if isinstance(clob_token_ids, str) and clob_token_ids:
                 try:
                     token_ids = json.loads(clob_token_ids)
@@ -86,10 +88,14 @@ def fetch_all_data():
             else:
                 token_ids = []
             
+            st.write(f"  Parsed token_ids: {token_ids}")
+            
             # Get the YES token (usually first one)
             if token_ids:
                 yes_token_id = token_ids[0]
+                st.write(f"  Fetching orderbook for token: {yes_token_id[:16]}...")
                 bid, ask = fetch_orderbook(yes_token_id)
+                st.write(f"  Got bid={bid}, ask={ask}")
                 
                 data.append({
                     'name': candidate_name,
