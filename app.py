@@ -5,18 +5,21 @@ from datetime import datetime
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
-MARKET_SLUGS = {
-    "Henrique Gouveia e Melo": "will-henrique-gouveia-e-melo-win-the-2026-portugal-presidential-election",
-    "Luís Marques Mendes": "will-luis-marques-mendes-win-the-2026-portugal-presidential-election",
-    "António José Seguro": "will-antonio-jose-seguro-win-the-2026-portugal-presidential-election",
-    "André Ventura": "will-andre-ventura-win-the-2026-portugal-presidential-election"
-}
+CANDIDATES = [
+    "Henrique Gouveia e Melo",
+    "Luís Marques Mendes",
+    "António José Seguro",
+    "André Ventura"
+]
 
-def fetch_market_data(slug):
-    """Fetch market data from Polymarket API"""
+def fetch_portugal_markets():
+    """Fetch all Portugal presidential election markets"""
     try:
         url = "https://gamma-api.polymarket.com/markets"
-        params = {"slug": slug}
+        params = {
+            "search": "portugal presidential",
+            "limit": 50
+        }
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -24,51 +27,83 @@ def fetch_market_data(slug):
         resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         
-        markets = resp.json()
-        
-        if markets and len(markets) > 0:
-            market = markets[0]
-            return {
-                'name': market.get('question', ''),
-                'bid': float(market.get('bestBid', 0)),
-                'ask': float(market.get('bestAsk', 0)),
-                'volume': market.get('volume', 0),
-                'liquidity': market.get('liquidity', 0)
-            }
-        return None
+        return resp.json()
         
     except Exception as e:
-        st.warning(f"Error fetching {slug}: {e}")
-        return None
+        st.warning(f"Error fetching markets: {e}")
+        return []
 
 def fetch_all_data():
     """Fetch data for all candidates"""
     data = []
-    progress = st.progress(0)
     status = st.empty()
     
-    for i, (name, slug) in enumerate(MARKET_SLUGS.items()):
-        status.text(f"Fetching {name}...")
-        market = fetch_market_data(slug)
+    status.text("Searching for Portugal presidential election market...")
+    markets = fetch_portugal_markets()
+    
+    if not markets:
+        st.error("No markets found")
+        return []
+    
+    # Display what we found for debugging
+    st.write(f"Found {len(markets)} market(s) matching 'portugal presidential'")
+    
+    for market in markets:
+        question = market.get("question", "").lower()
         
-        if market:
-            data.append({
-                'name': name,
-                'bid': market['ask'],  # Swap: API's bestBid is actually the ask
-                'ask': market['bid'],  # API's bestAsk is actually the bid
-                'volume': market['volume'],
-                'liquidity': market['liquidity']
-            })
-        else:
-            data.append({
-                'name': name,
-                'bid': 0.0,
-                'ask': 0.0,
-                'volume': 0,
-                'liquidity': 0
-            })
+        st.write(f"Market: {market.get('question', 'N/A')[:80]}...")
         
-        progress.progress((i + 1) / len(MARKET_SLUGS))
+        # Check if this market has candidate outcomes
+        outcomes = market.get("outcomes", [])
+        if isinstance(outcomes, str):
+            try:
+                import json
+                outcomes = json.loads(outcomes)
+            except:
+                outcomes = []
+        
+        st.write(f"  Found {len(outcomes)} outcomes")
+        
+        # Look for candidate names in outcomes
+        matched_candidates = []
+        for outcome in outcomes:
+            if isinstance(outcome, dict):
+                outcome_name = outcome.get("name", str(outcome))
+            else:
+                outcome_name = str(outcome)
+            
+            for candidate in CANDIDATES:
+                if candidate.lower() in outcome_name.lower() or outcome_name.lower() in candidate.lower():
+                    matched_candidates.append({
+                        'candidate': candidate,
+                        'outcome': outcome_name,
+                        'outcome_obj': outcome
+                    })
+        
+        if len(matched_candidates) >= 4:
+            st.write(f"  ✓ This market has all 4 candidates!")
+            
+            # This is our market! Extract bid/ask for each
+            for match in matched_candidates:
+                candidate = match['candidate']
+                outcome = match['outcome_obj']
+                
+                # Try to get price data from outcome
+                bid = 0.0
+                ask = 0.0
+                
+                if isinstance(outcome, dict):
+                    # Look for bestBid/bestAsk in outcome object
+                    bid = float(outcome.get('bestBid', outcome.get('price', 0)))
+                    ask = float(outcome.get('bestAsk', outcome.get('price', 0)))
+                
+                data.append({
+                    'name': candidate,
+                    'bid': bid,
+                    'ask': ask
+                })
+            
+            break
     
     status.empty()
     return data
@@ -90,11 +125,6 @@ with st.expander("Debug Info"):
             st.write(f"  Bid: {d['bid']:.4f} ({d['bid']*100:.2f}%)")
             st.write(f"  Ask: {d['ask']:.4f} ({d['ask']*100:.2f}%)")
             st.write(f"  Spread: {(d['bid']-d['ask'])*100:.2f}¢")
-            try:
-                vol = float(d['volume']) if d['volume'] else 0
-                st.write(f"  Volume: ${vol:,.0f}")
-            except:
-                st.write(f"  Volume: {d['volume']}")
         
         st.write(f"\n**Totals**")
         st.write(f"  Total Bid: {total_bid:.4f} ({total_bid*100:.2f}%)")
@@ -141,16 +171,11 @@ with col3:
 table_data = []
 for d in data:
     spread = (d['bid'] - d['ask']) * 100
-    try:
-        vol = f"${float(d['volume']):,.0f}" if d['volume'] else "$0"
-    except:
-        vol = str(d['volume'])
     table_data.append({
         'Candidate': d['name'],
         'Bid %': f"{d['bid']*100:.2f}",
         'Ask %': f"{d['ask']*100:.2f}",
-        'Spread (¢)': f"{spread:.2f}",
-        'Volume': vol
+        'Spread (¢)': f"{spread:.2f}"
     })
 st.dataframe(table_data, use_container_width=True)
 
