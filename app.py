@@ -47,6 +47,8 @@ def fetch_orderbook(token_id):
         resp.raise_for_status()
         
         ob = resp.json()
+        st.write(f"    Orderbook response keys: {list(ob.keys()) if isinstance(ob, dict) else 'not a dict'}")
+        st.write(f"    Full response: {str(ob)[:200]}")
         
         bid = 0.0
         ask = 0.0
@@ -59,6 +61,7 @@ def fetch_orderbook(token_id):
         
         return bid, ask
     except Exception as e:
+        st.write(f"    Orderbook error: {e}")
         return 0.0, 0.0
 
 def fetch_all_data():
