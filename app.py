@@ -2,37 +2,40 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-from eth_account import Account
-from eth_account.messages import encode_defunct
 import json
 
 st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
 
 # Your credentials
-PRIVATE_KEY = "0xd70383d8c5d337855f12302491c56eb86cd8f34d6cf20bfb824352d1294b8c0c"
 FUNDER = "0x0B309C3fDa618c0a9555bf23eFfB0ba75009C0B6"
-MARKET_ID = "0x2b1e18ef56cb7222ce2fb03d6cd9fb8fcca06d80b64d0dacbe6ce2f00ab31d00"
 
-CANDIDATES = [
-    "Henrique Gouveia e Melo",
-    "Luís Marques Mendes",
-    "António José Seguro",
-    "André Ventura"
-]
+CANDIDATES = {
+    "Henrique Gouveia e Melo": "0x2b1e18ef56cb7222ce2fb03d6cd9fb8fcca06d80b64d0dacbe6ce2f00ab31d00",
+    "Luís Marques Mendes": "0xed888eb64bffa457086fb5904e9b2046da9aa31c5db36e9d4a303efa7e850d76",
+    "António José Seguro": "0xa062dea464f0e8fc3381176494198cf45574ec190eca77a40f49988320fa15f2",
+    "André Ventura": "0xbcb33ad98c8141b10f2350ef687eddf0660484ecc15be42ecdae64339e64dce1"
+}
 
-def sign_message(message):
-    """Sign a message with your private key"""
+def fetch_market_by_condition_id(condition_id):
+    """Fetch market data by condition ID"""
     try:
-        account = Account.from_key(PRIVATE_KEY)
-        message_hash = encode_defunct(text=message)
-        signed = account.sign_message(message_hash)
-        return signed.signature.hex()
+        url = "https://gamma-api.polymarket.com/markets"
+        params = {"condition_ids": condition_id}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        markets = resp.json()
+        return markets[0] if markets else None
+        
     except Exception as e:
-        st.error(f"Error signing message: {e}")
         return None
 
 def fetch_orderbook(token_id):
-    """Fetch orderbook for a token using authenticated API"""
+    """Fetch orderbook for a token"""
     try:
         url = f"https://clob.polymarket.com/orderbook/{token_id}"
         headers = {
@@ -58,86 +61,48 @@ def fetch_orderbook(token_id):
     except Exception as e:
         return 0.0, 0.0
 
-def fetch_market_with_tokens():
-    """Fetch market and token IDs"""
-    try:
-        url = "https://gamma-api.polymarket.com/markets"
-        params = {"condition_ids": MARKET_ID}
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        
-        markets = resp.json()
-        return markets[0] if markets else None
-        
-    except Exception as e:
-        st.error(f"Error fetching market: {e}")
-        return None
-
 def fetch_all_data():
     """Fetch data for all candidates"""
     data = []
+    progress = st.progress(0)
     status = st.empty()
     
-    status.text("Fetching Portugal presidential election market...")
-    market = fetch_market_with_tokens()
-    
-    if not market:
-        st.error("Could not fetch market")
-        return []
-    
-    st.write(f"✓ Market: {market.get('question', 'N/A')[:80]}...")
-    
-    # Get outcomes and token info
-    outcomes = market.get("outcomes", [])
-    if isinstance(outcomes, str):
-        try:
-            outcomes = json.loads(outcomes)
-        except:
-            outcomes = []
-    
-    # Get CLOB token IDs
-    clob_token_ids = market.get("clobTokenIds", "")
-    if isinstance(clob_token_ids, str) and clob_token_ids:
-        try:
-            token_ids = json.loads(clob_token_ids)
-        except:
-            token_ids = clob_token_ids.split(",") if "," in clob_token_ids else [clob_token_ids]
-    else:
-        token_ids = []
-    
-    st.write(f"Found {len(outcomes)} outcomes, {len(token_ids)} token IDs")
-    
-    # Fetch orderbook for each token
-    with st.spinner("Fetching live orderbooks..."):
-        for i, outcome in enumerate(outcomes):
-            if isinstance(outcome, dict):
-                outcome_name = outcome.get("name", str(outcome))
+    for idx, (candidate_name, condition_id) in enumerate(CANDIDATES.items()):
+        status.text(f"Fetching {candidate_name}...")
+        
+        # Fetch market
+        market = fetch_market_by_condition_id(condition_id)
+        
+        if market:
+            st.write(f"✓ {candidate_name}: Found market")
+            
+            # Get token IDs for the YES outcome
+            clob_token_ids = market.get("clobTokenIds", "")
+            if isinstance(clob_token_ids, str) and clob_token_ids:
+                try:
+                    token_ids = json.loads(clob_token_ids)
+                except:
+                    token_ids = clob_token_ids.split(",") if "," in clob_token_ids else [clob_token_ids]
             else:
-                outcome_name = str(outcome)
+                token_ids = []
             
-            # Find matching candidate
-            matched_candidate = None
-            for candidate in CANDIDATES:
-                if candidate.lower() in outcome_name.lower() or outcome_name.lower() in candidate.lower():
-                    matched_candidate = candidate
-                    break
-            
-            if matched_candidate and i < len(token_ids):
-                token_id = token_ids[i]
-                status.text(f"Fetching orderbook for {matched_candidate}...")
-                
-                bid, ask = fetch_orderbook(token_id)
+            # Get the YES token (usually first one)
+            if token_ids:
+                yes_token_id = token_ids[0]
+                bid, ask = fetch_orderbook(yes_token_id)
                 
                 data.append({
-                    'name': matched_candidate,
+                    'name': candidate_name,
                     'bid': bid,
                     'ask': ask,
-                    'token_id': token_id
+                    'token_id': yes_token_id
                 })
+            else:
+                st.write(f"✗ {candidate_name}: No token IDs found")
+        else:
+            st.write(f"✗ {candidate_name}: Market not found")
+        
+        progress.progress((idx + 1) / len(CANDIDATES))
     
     status.empty()
     return data
@@ -159,7 +124,6 @@ with st.expander("Debug Info"):
             st.write(f"  Bid: {d['bid']:.4f} ({d['bid']*100:.2f}%)")
             st.write(f"  Ask: {d['ask']:.4f} ({d['ask']*100:.2f}%)")
             st.write(f"  Spread: {(d['bid']-d['ask'])*100:.2f}¢")
-            st.write(f"  Token ID: {d['token_id'][:16]}...")
         
         st.write(f"\n**Totals**")
         st.write(f"  Total Bid: {total_bid:.4f} ({total_bid*100:.2f}%)")
