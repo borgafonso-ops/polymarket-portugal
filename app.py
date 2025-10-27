@@ -1,6 +1,5 @@
-import re
-import requests
 import streamlit as st
+import requests
 import pandas as pd
 
 st.set_page_config(
@@ -9,80 +8,111 @@ st.set_page_config(
 )
 
 # ---- CONFIG ----
-EVENT_SLUG = "portugal-presidential-election"  # derived from the URL
+EVENT_SLUG = "portugal-presidential-election"
 CANDIDATES = [
     "Henrique Gouveia e Melo (IND)",
     "Luís Marques Mendes (PSD)",
     "António José Seguro (IND)",
     "André Ventura (CH)",
 ]
-
 THRESHOLD_LOW = 0.97
 THRESHOLD_HIGH = 1.03
-DEPTH = 100  # volume depth (shares) to consider
+DEPTH = 100
 
 
+# ---- FUNCTIONS ----
 @st.cache_data(ttl=300)
-def get_event_id(slug: str) -> str:
-    """Fetch the correct event_id from the slug name."""
-    resp = requests.get("https://clob.polymarket.com/markets")
-    resp.raise_for_status()
-    data = resp.json()
-
-    for m in data:
-        if slug in m.get("slug", ""):
-            return m.get("event_id")
-    raise ValueError(f"No event found for slug '{slug}'")
+def get_event_id(slug: str):
+    """Try to fetch the event_id from all known Polymarket endpoints."""
+    urls = [
+        "https://clob.polymarket.com/markets",
+        "https://clob.polymarket.com/events",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            # data may be list or dict
+            markets = data.get("markets") if isinstance(data, dict) else data
+            if not isinstance(markets, list):
+                continue
+            for m in markets:
+                if slug in str(m.get("slug", "")):
+                    return m.get("event_id")
+        except Exception:
+            continue
+    raise ValueError(f"Could not find event_id for slug '{slug}'")
 
 
 @st.cache_data(ttl=30)
-def get_orderbooks(event_slug: str):
-    """Fetch orderbooks for all submarkets in the event."""
-    event_id = get_event_id(event_slug)
+def get_orderbooks():
+    """Fetch all markets for the event."""
+    event_id = get_event_id(EVENT_SLUG)
     url = f"https://clob.polymarket.com/markets?event_id={event_id}"
     resp = requests.get(url)
     resp.raise_for_status()
+
     data = resp.json()
+    # Handle schema variations
+    if isinstance(data, dict):
+        markets = data.get("markets") or data.get("data")
+    elif isinstance(data, list):
+        markets = data
+    else:
+        raise ValueError("Unexpected API format.")
 
-    markets = data.get("markets") or data.get("data") or data
     if not isinstance(markets, list):
-        raise ValueError("Unexpected API response format")
+        raise ValueError("Markets data missing or invalid.")
 
-    return {m.get("question") or m.get("title") or "Unknown": m for m in markets}
+    result = {}
+    for m in markets:
+        q = m.get("question") or m.get("title") or m.get("slug") or str(m)
+        result[q] = m
+    return result
 
 
 def top_price_with_volume(orders, target_volume=DEPTH):
-    filled, weighted_price = 0, 0
+    """Compute volume-weighted average up to a given depth."""
+    if not orders:
+        return None
+    filled, weighted = 0, 0
     for o in orders:
-        v = min(target_volume - filled, o["size"])
-        weighted_price += o["price"] * v
+        v = min(target_volume - filled, o.get("size", 0))
+        weighted += o.get("price", 0) * v
         filled += v
         if filled >= target_volume:
             break
-    return weighted_price / filled if filled else None
+    return weighted / filled if filled else None
 
 
 def get_best_prices(market):
+    """Fetch orderbook if not embedded."""
     orderbook = market.get("orderbook")
     if not orderbook:
-        mid = market.get("id") or market.get("market_id")
-        ob_resp = requests.get(f"https://clob.polymarket.com/orderbook?market={mid}")
+        market_id = market.get("id") or market.get("market_id")
+        if not market_id:
+            return None, None
+        ob_url = f"https://clob.polymarket.com/orderbook?market={market_id}"
+        ob_resp = requests.get(ob_url)
         if ob_resp.status_code != 200:
             return None, None
         orderbook = ob_resp.json()
-
     bids, asks = orderbook.get("bids", []), orderbook.get("asks", [])
     return top_price_with_volume(bids), top_price_with_volume(asks)
 
 
 def get_market_data():
-    markets = get_orderbooks(EVENT_SLUG)
+    """Return bid/ask for each candidate."""
+    markets = get_orderbooks()
     rows = []
     for cand in CANDIDATES:
-        market = markets.get(cand)
-        if not market:
+        # Try flexible matching (API questions often vary slightly)
+        match = next((m for k, m in markets.items() if cand.lower() in k.lower()), None)
+        if not match:
             continue
-        bid, ask = get_best_prices(market)
+        bid, ask = get_best_prices(match)
         rows.append({"Candidate": cand, "Bid": bid, "Ask": ask})
     return pd.DataFrame(rows)
 
@@ -91,14 +121,15 @@ def get_market_data():
 st.title("🇵🇹 Polymarket – Portugal Presidential Election Tracker")
 st.caption("Tracks the sum of bids and asks for top candidates. Data from Polymarket’s public CLOB API.")
 
+interval = st.slider("Auto-refresh interval (seconds)", 10, 120, 30)
+
 try:
     df = get_market_data()
-
     if df.empty:
         st.warning("No market data found. Try again later or check event slug.")
     else:
-        sum_bids = df["Bid"].sum()
-        sum_asks = df["Ask"].sum()
+        sum_bids = df["Bid"].sum(skipna=True)
+        sum_asks = df["Ask"].sum(skipna=True)
 
         col1, col2 = st.columns(2)
         col1.metric("Sum of Best Bids", f"{sum_bids:.3f}")
@@ -115,3 +146,6 @@ try:
 
 except Exception as e:
     st.error(f"⚠️ Error fetching market data: {e}")
+
+st.caption("Auto-refresh enabled. Updates every few seconds automatically.")
+st.experimental_rerun()
