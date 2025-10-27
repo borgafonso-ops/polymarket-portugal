@@ -1,191 +1,82 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime
-import json
+import time
 
-st.set_page_config(page_title="Polymarket Portugal Monitor", layout="wide")
+st.set_page_config(page_title="Polymarket Portugal Election Tracker", layout="wide")
 
-# Your credentials
-FUNDER = "0x0B309C3fDa618c0a9555bf23eFfB0ba75009C0B6"
+# ---- CONFIG ----
+EVENT_ID = "1761563334297"  # Portugal Presidential Election
+CANDIDATES = [
+    "Henrique Gouveia e Melo (IND)",
+    "Luís Marques Mendes (PSD)",
+    "António José Seguro (IND)",
+    "André Ventura (CH)",
+]
+THRESHOLD_LOW = 0.97
+THRESHOLD_HIGH = 1.03
+DEPTH = 100
 
-CANDIDATES = {
-    "Henrique Gouveia e Melo": "0x2b1e18ef56cb7222ce2fb03d6cd9fb8fcca06d80b64d0dacbe6ce2f00ab31d00",
-    "Luís Marques Mendes": "0xed888eb64bffa457086fb5904e9b2046da9aa31c5db36e9d4a303efa7e850d76",
-    "António José Seguro": "0xa062dea464f0e8fc3381176494198cf45574ec190eca77a40f49988320fa15f2",
-    "André Ventura": "0xbcb33ad98c8141b10f2350ef687eddf0660484ecc15be42ecdae64339e64dce1"
-}
+# ---- FUNCTIONS ----
+@st.cache_data(ttl=30)
+def get_orderbooks():
+    url = f"https://clob.polymarket.com/markets?event_id={EVENT_ID}"
+    resp = requests.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+    return {m["question"]: m for m in data["markets"]}
 
-def fetch_market_by_condition_id(condition_id):
-    """Fetch market data by condition ID"""
-    try:
-        url = "https://gamma-api.polymarket.com/markets"
-        params = {"condition_ids": condition_id}
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        resp.raise_for_status()
-        
-        markets = resp.json()
-        return markets[0] if markets else None
-        
-    except Exception as e:
-        return None
+def top_price_with_volume(orders, target_volume=DEPTH):
+    filled, weighted_price = 0, 0
+    for o in orders:
+        v = min(target_volume - filled, o["size"])
+        weighted_price += o["price"] * v
+        filled += v
+        if filled >= target_volume:
+            break
+    return weighted_price / filled if filled else None
 
-def fetch_orderbook(token_id):
-    """Fetch orderbook for a token"""
-    try:
-        url = f"https://clob.polymarket.com/orderbook/{token_id}"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'POLY-ADDRESS': FUNDER,
-        }
-        
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        
-        ob = resp.json()
-        st.write(f"    Orderbook response keys: {list(ob.keys()) if isinstance(ob, dict) else 'not a dict'}")
-        st.write(f"    Full response: {str(ob)[:200]}")
-        
-        bid = 0.0
-        ask = 0.0
-        
-        if isinstance(ob, dict):
-            if "bids" in ob and ob["bids"]:
-                bid = float(ob["bids"][0].get("price", 0))
-            if "asks" in ob and ob["asks"]:
-                ask = float(ob["asks"][0].get("price", 0))
-        
-        return bid, ask
-    except Exception as e:
-        st.write(f"    Orderbook error: {e}")
-        return 0.0, 0.0
+def get_best_prices(market):
+    bids = market["orderbook"]["bids"]
+    asks = market["orderbook"]["asks"]
+    return top_price_with_volume(bids), top_price_with_volume(asks)
 
-def fetch_all_data():
-    """Fetch data for all candidates"""
-    data = []
-    progress = st.progress(0)
-    status = st.empty()
-    
-    for idx, (candidate_name, condition_id) in enumerate(CANDIDATES.items()):
-        status.text(f"Fetching {candidate_name}...")
-        
-        # Fetch market
-        market = fetch_market_by_condition_id(condition_id)
-        
-        if market:
-            st.write(f"✓ {candidate_name}: Found market")
-            
-            # Get token IDs for the YES outcome
-            clob_token_ids = market.get("clobTokenIds", "")
-            st.write(f"  Raw clobTokenIds: {clob_token_ids}")
-            
-            if isinstance(clob_token_ids, str) and clob_token_ids:
-                try:
-                    token_ids = json.loads(clob_token_ids)
-                except:
-                    token_ids = clob_token_ids.split(",") if "," in clob_token_ids else [clob_token_ids]
-            else:
-                token_ids = []
-            
-            st.write(f"  Parsed token_ids: {token_ids}")
-            
-            # Get the YES token (usually first one)
-            if token_ids:
-                yes_token_id = token_ids[0]
-                st.write(f"  Fetching orderbook for token: {yes_token_id[:16]}...")
-                bid, ask = fetch_orderbook(yes_token_id)
-                st.write(f"  Got bid={bid}, ask={ask}")
-                
-                data.append({
-                    'name': candidate_name,
-                    'bid': bid,
-                    'ask': ask,
-                    'token_id': yes_token_id
-                })
-            else:
-                st.write(f"✗ {candidate_name}: No token IDs found")
-        else:
-            st.write(f"✗ {candidate_name}: Market not found")
-        
-        progress.progress((idx + 1) / len(CANDIDATES))
-    
-    status.empty()
-    return data
+def get_market_data():
+    markets = get_orderbooks()
+    rows = []
+    for cand in CANDIDATES:
+        m = markets.get(cand)
+        if not m:
+            continue
+        bid, ask = get_best_prices(m)
+        rows.append({"Candidate": cand, "Bid": bid, "Ask": ask})
+    return pd.DataFrame(rows)
 
-# MAIN
-st.title("🇵🇹 Polymarket Portugal - Bid/Offer Monitor")
-st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
+# ---- UI ----
+st.title("🇵🇹 Polymarket – Portugal Presidential Election Tracker")
 
-with st.spinner("Fetching LIVE data..."):
-    data = fetch_all_data()
+auto_refresh = st.checkbox("Auto-refresh every 30s", value=True)
+if st.button("Refresh now") or auto_refresh:
+    df = get_market_data()
+    sum_bids = df["Bid"].sum()
+    sum_asks = df["Ask"].sum()
 
-with st.expander("Debug Info"):
-    if data:
-        total_bid = sum(d['bid'] for d in data)
-        total_ask = sum(d['ask'] for d in data)
-        
-        for d in data:
-            st.write(f"**{d['name']}**")
-            st.write(f"  Bid: {d['bid']:.4f} ({d['bid']*100:.2f}%)")
-            st.write(f"  Ask: {d['ask']:.4f} ({d['ask']*100:.2f}%)")
-            st.write(f"  Spread: {(d['bid']-d['ask'])*100:.2f}¢")
-        
-        st.write(f"\n**Totals**")
-        st.write(f"  Total Bid: {total_bid:.4f} ({total_bid*100:.2f}%)")
-        st.write(f"  Total Ask: {total_ask:.4f} ({total_ask*100:.2f}%)")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Sum of Best Bids", f"{sum_bids:.3f}")
+    with col2:
+        st.metric("Sum of Best Asks", f"{sum_asks:.3f}")
 
-if not data or all(d['bid'] == 0 and d['ask'] == 0 for d in data):
-    st.error("Could not fetch bid/ask prices")
-    st.stop()
+    if sum_bids < THRESHOLD_LOW:
+        st.warning(f"Market Undervalued (<{THRESHOLD_LOW}) → possible long arb")
+    elif sum_asks > THRESHOLD_HIGH:
+        st.error(f"Market Overvalued (>{THRESHOLD_HIGH}) → possible short arb")
+    else:
+        st.success("Market within normal bounds.")
 
-data.sort(key=lambda x: x['bid'], reverse=True)
+    st.dataframe(df.round(3), use_container_width=True)
 
-# METRICS
-cols = st.columns(4)
-total_bid = 0
-total_ask = 0
+    st.caption("Data pulled from Polymarket’s public CLOB API.")
+else:
+    st.info("Click 'Refresh now' to fetch data.")
 
-for i, d in enumerate(data):
-    with cols[i]:
-        st.markdown(f"**{d['name'].split()[-1]}**")
-        
-        st.metric("Bid %", f"{d['bid']*100:.2f}%")
-        st.metric("Ask %", f"{d['ask']*100:.2f}%")
-        st.metric("Spread (¢)", f"{(d['bid']-d['ask'])*100:.2f}")
-        
-        total_bid += d['bid']
-        total_ask += d['ask']
-
-# TOTALS
-st.divider()
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Total Bid", f"{total_bid*100:.2f}%")
-with col2:
-    st.metric("Total Ask", f"{total_ask*100:.2f}%")
-with col3:
-    if total_bid < 1:
-        profit = (1 - total_bid) * 100
-        st.metric("Buy Arb", f"+{profit:.2f}%", delta_color="off")
-    elif total_ask > 1:
-        loss = (total_ask - 1) * 100
-        st.metric("Sell Arb", f"-{loss:.2f}%", delta_color="off")
-
-# TABLE
-table_data = []
-for d in data:
-    spread = (d['bid'] - d['ask']) * 100
-    table_data.append({
-        'Candidate': d['name'],
-        'Bid %': f"{d['bid']*100:.2f}",
-        'Ask %': f"{d['ask']*100:.2f}",
-        'Spread (¢)': f"{spread:.2f}"
-    })
-st.dataframe(table_data, use_container_width=True)
-
-if st.button("🔄 REFRESH"):
-    st.rerun()
